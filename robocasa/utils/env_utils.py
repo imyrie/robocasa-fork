@@ -1546,6 +1546,17 @@ def generate_random_robot_pos(env, anchor_pos, anchor_ori, pos_dev_x, pos_dev_y)
     )
     return anchor_pos + global_deviation
 
+def get_mobile_base_joint_name(env, suffix):
+    """Return the mobile-base joint name for the current embodiment."""
+    for prefix in ("mobilebase0", "leg0"):
+        joint_name = f"{prefix}_joint_mobile_{suffix}"
+        if joint_name in env.sim.model.joint_names:
+            return joint_name
+
+    raise ValueError(
+        f"No mobile-base '{suffix}' joint found. "
+        f"Available joints: {env.sim.model.joint_names}"
+    )
 
 def set_robot_to_position(env, global_pos):
     local_pos = np.matmul(
@@ -1558,13 +1569,11 @@ def set_robot_to_position(env, global_pos):
 
     # check the axis of the mobile base joints to determine which
     # joint moves in the x direction and which moves in the y
-    x_jnt_name, y_jnt_name = (
-        "mobilebase0_joint_mobile_forward",
-        "mobilebase0_joint_mobile_side",
-    )
+    x_jnt_name = get_mobile_base_joint_name(env, "forward")
+    y_jnt_name = get_mobile_base_joint_name(env, "side")
     if (
         env.sim.model.jnt_axis[
-            env.sim.model.joint_name2id("mobilebase0_joint_mobile_forward")
+            env.sim.model.joint_name2id(x_jnt_name)
         ]
         == np.array([0, 1, 0])
     ).all():
@@ -1605,8 +1614,9 @@ def set_robot_base(
     # )
 
     with no_collision(env.sim):
+        yaw_jnt_name = get_mobile_base_joint_name(env, "yaw")
         env.sim.data.qpos[
-            env.sim.model.get_joint_qpos_addr("mobilebase0_joint_mobile_yaw")
+            env.sim.model.get_joint_qpos_addr(yaw_jnt_name)
         ] = env.rng.uniform(-rot_dev, rot_dev)
         # l_elbow_pitch_id = self.sim.model.get_joint_qpos_addr("robot0_l_elbow_pitch")
         # l_elbow_pitch_range = self.sim.model.jnt_range[l_elbow_pitch_id]

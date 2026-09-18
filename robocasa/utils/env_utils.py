@@ -1560,38 +1560,35 @@ def get_mobile_base_joint_name(env, suffix):
 
 def set_robot_to_position(env, global_pos):
     local_pos = np.matmul(
-        T.matrix_inverse(T.euler2mat(env.init_robot_base_ori_anchor)), global_pos
+        T.matrix_inverse(T.euler2mat(env.init_robot_base_ori_anchor)),
+        global_pos,
     )
     undo_pos = np.matmul(
         T.matrix_inverse(T.euler2mat(env.init_robot_base_ori_anchor)),
         [-10.0, -10.0, 0.0],
     )
 
-    # check the axis of the mobile base joints to determine which
-    # joint moves in the x direction and which moves in the y
     x_jnt_name = get_mobile_base_joint_name(env, "forward")
     y_jnt_name = get_mobile_base_joint_name(env, "side")
+
     if (
         env.sim.model.jnt_axis[
             env.sim.model.joint_name2id(x_jnt_name)
         ]
         == np.array([0, 1, 0])
     ).all():
-        x_jnt_name, y_jnt_name = (
-            "mobilebase0_joint_mobile_side",
-            "mobilebase0_joint_mobile_forward",
-        )
+        x_jnt_name, y_jnt_name = y_jnt_name, x_jnt_name
 
     with no_collision(env.sim):
-        env.sim.data.qpos[env.sim.model.get_joint_qpos_addr(x_jnt_name)] = (
-            undo_pos[0] + local_pos[0]
-        )
-        env.sim.data.qpos[env.sim.model.get_joint_qpos_addr(y_jnt_name)] = (
-            undo_pos[1] + local_pos[1]
-        )
+        env.sim.data.qpos[
+            env.sim.model.get_joint_qpos_addr(x_jnt_name)
+        ] = undo_pos[0] + local_pos[0]
+
+        env.sim.data.qpos[
+            env.sim.model.get_joint_qpos_addr(y_jnt_name)
+        ] = undo_pos[1] + local_pos[1]
 
         env.sim.forward()
-
 
 def set_robot_base(
     env,

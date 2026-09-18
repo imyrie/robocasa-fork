@@ -72,7 +72,7 @@ class PandaOmronKeyConverter:
         for k, v in obs.items():
             if k.startswith("hand.") or k.startswith("body."):
                 observation_space["state." + k[5:]] = spaces.Box(
-                    low=-1, high=1, shape=(len(v),), dtype=np.float32
+                    low=-1, high=1, shape=np.asarray(v).shape, dtype=np.float32
                 )
             else:
                 raise ValueError(f"Unknown key: {k}")
@@ -154,10 +154,13 @@ class RoboCasaGymEnv(gym.Env):
         self.key_converter = PandaOmronKeyConverter
         (
             _,
-            camera_names,
+            default_camera_names,
             default_camera_widths,
             default_camera_heights,
         ) = self.key_converter.get_camera_config()
+
+        if camera_names is None:
+            camera_names = default_camera_names
 
         if camera_widths is None:
             camera_widths = default_camera_widths
@@ -171,6 +174,7 @@ class RoboCasaGymEnv(gym.Env):
             render_onscreen=False,
             # seed=0, # set seed=None to run unseeded
             split=split,
+            camera_names=camera_names,
             camera_widths=camera_widths,
             camera_heights=camera_heights,
             **kwargs,
@@ -239,8 +243,13 @@ class RoboCasaGymEnv(gym.Env):
 
         # now remap observation and action space
         self.observation_space = self.key_converter.deduce_observation_space(self.env)
-        mapped_names, _, _, _ = self.key_converter.get_camera_config()
-        camera_depths = _camera_depth_flags(self.env, len(mapped_names))
+        mapped_names = [
+            f"video.{camera_name}" for camera_name in self.camera_names
+        ]
+        camera_depths = _camera_depth_flags(
+            self.env,
+            len(self.camera_names),
+        )
         for mapped_name, cam_depth in zip(mapped_names, camera_depths):
             self.observation_space[mapped_name] = spaces.Box(
                 low=0,
@@ -303,22 +312,41 @@ class RoboCasaGymEnv(gym.Env):
     def get_observation(self, raw_obs):
         basic_obs = self.get_basic_observation(raw_obs)
         obs = {}
+
+        # Convert robot-state observations into the standardized state format.
         temp_obs = self.key_converter.map_obs(basic_obs)
-        for k, v in temp_obs.items():
-            if k.startswith("hand.") or k.startswith("body."):
-                obs["state." + k[5:]] = v
+
+        for key, value in temp_obs.items():
+            if key.startswith("hand.") or key.startswith("body."):
+                obs["state." + key[5:]] = value
             else:
-                raise ValueError(f"Unknown key: {k}")
-        mapped_names, camera_names, _, _ = self.key_converter.get_camera_config()
-        camera_depths = _camera_depth_flags(self.env, len(mapped_names))
-        for mapped_name, camera_name, cam_depth in zip(
-            mapped_names, camera_names, camera_depths
+                raise ValueError(f"Unknown key: {key}")
+
+        # Use the cameras explicitly selected when the environment was created.
+        camera_names = self.camera_names
+        mapped_names = [
+            f"video.{camera_name}" for camera_name in camera_names
+        ]
+        camera_depths = _camera_depth_flags(
+            self.env,
+            len(camera_names),
+        )
+
+        for mapped_name, camera_name, camera_depth in zip(
+            mapped_names,
+            camera_names,
+            camera_depths,
         ):
-            image = basic_obs[camera_name + "_image"]
-            # Legacy key (e.g. video.robot0_agentview_left) — unchanged when depth is off.
+            image_key = f"{camera_name}_image"
+            image = basic_obs[image_key]
+
+            # RGB observation
             obs[mapped_name] = image
-            if cam_depth:
+
+            # Optional depth observation
+            if camera_depth:
                 obs[f"{mapped_name}_image"] = image
+
                 depth_key = f"{camera_name}_depth"
                 if depth_key in basic_obs:
                     obs[f"{mapped_name}_depth"] = basic_obs[depth_key]

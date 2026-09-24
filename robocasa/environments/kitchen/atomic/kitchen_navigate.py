@@ -123,13 +123,33 @@ class NavigateKitchen(Kitchen):
 
     def _check_success(self):
         """
-        Check if the navigation task is successful.
-        This is done by checking if the robot is within a certain distance of the target fixture and the robot is facing the fixture.
+        Check whether the robot is close to and facing the target fixture. and the robot is facing the fixture.
 
         Returns:
             bool: True if the task is successful, False otherwise.
         """
-        robot_id = self.sim.model.body_name2id("mobilebase0_base")
+        possible_base_bodies = (
+            "mobilebase0_base",  # PandaOmron
+            "leg0_body",         # SpotWithArmFloating
+            "robot0_base",       # fallback for other embodiments
+        )
+
+        base_body_name = next(
+            (
+                body_name
+                for body_name in possible_base_bodies
+                if body_name in self.sim.model.body_names
+            ),
+            None,
+        )
+
+        if base_body_name is None:
+            raise ValueError(
+                "Could not identify the robot base body. "
+                f"Available bodies: {self.sim.model.body_names}"
+            )
+
+        robot_id = self.sim.model.body_name2id(base_body_name)
         base_pos = np.array(self.sim.data.body_xpos[robot_id])
         pos_check = np.linalg.norm(self.target_pos[:2] - base_pos[:2]) <= 0.20
         base_ori = T.mat2euler(

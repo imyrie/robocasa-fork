@@ -170,3 +170,7 @@ robocasa/scripts/taskgen/task_prompting/outputs/
 **/.DS_Store
 
 *.bak
+
+saga_robocasa/trajectories/*.npz
+saga_robocasa/trajectories/*.json
+!saga_robocasa/trajectories/.gitkeep

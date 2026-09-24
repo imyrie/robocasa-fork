@@ -1,3 +1,4 @@
+import argparse
 import heapq
 import json
 from datetime import datetime
@@ -227,6 +228,20 @@ def astar(blocked, start, goal, rows, columns):
 
 
 # ---------------------------------------------------------------------
+# Command-line configuration
+# ---------------------------------------------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=0,
+    help="Random seed used to reproduce the same kitchen episode.",
+)
+args = parser.parse_args()
+
+
+# ---------------------------------------------------------------------
 # Create the RoboCasa environment
 # ---------------------------------------------------------------------
 
@@ -237,6 +252,7 @@ env = gym.make(
     render_camera=["robot0_eye_in_hand"],
     camera_names=["robot0_eye_in_hand"],
     render_gpu_device_id=0,
+    seed=args.seed,
 )
 
 obs, info = env.reset()
@@ -365,6 +381,7 @@ def save_successful_trajectory():
         "target_yaw": target_yaw,
         "number_of_steps": len(recorded_base_actions),
         "success": True,
+        "seed": args.seed,
         "trajectory_file": trajectory_path.name,
     }
 
@@ -379,6 +396,7 @@ def save_successful_trajectory():
     return trajectory_path, metadata_path
 
 
+print("Seed:", args.seed)
 print("Instruction:", instruction)
 print("Start:", start_position)
 print("Target:", target_position)

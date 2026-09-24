@@ -72,7 +72,10 @@ class PandaOmronKeyConverter:
         for k, v in obs.items():
             if k.startswith("hand.") or k.startswith("body."):
                 observation_space["state." + k[5:]] = spaces.Box(
-                    low=-1, high=1, shape=np.asarray(v).shape, dtype=np.float32
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=np.asarray(v).shape,
+                    dtype=np.float32,
                 )
             else:
                 raise ValueError(f"Unknown key: {k}")
@@ -394,6 +397,14 @@ class RoboCasaGymEnv(gym.Env):
                 action[start_idx:end_idx] = act
             if isinstance(cc, HybridMobileBase):
                 action[-1] = action_dict.pop(f"{pf}base_mode")
+                
+            # Some embodiments do not have a torso or hybrid base mode.
+            # Remove converter outputs that do not correspond to a controller.
+            action_dict.pop(f"{pf}torso", None)
+
+            if not isinstance(cc, HybridMobileBase):
+                action_dict.pop(f"{pf}base_mode", None)
+
             env_action.append(action)
 
         assert len(action_dict) == 0, f"Unprocessed actions: {action_dict}"

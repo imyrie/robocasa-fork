@@ -168,3 +168,5 @@ robocasa/scripts/taskgen/task_prompting/outputs/
 
 # Always ignore macOS junk
 **/.DS_Store
+
+*.bak

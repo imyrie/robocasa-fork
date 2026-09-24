@@ -130,7 +130,7 @@ class NavigateKitchen(Kitchen):
         """
         possible_base_bodies = (
             "mobilebase0_base",  # PandaOmron
-            "leg0_body",         # SpotWithArmFloating
+            "leg0_support",      # SpotWithArmFloating
             "robot0_base",       # fallback for other embodiments
         )
 
@@ -151,7 +151,12 @@ class NavigateKitchen(Kitchen):
 
         robot_id = self.sim.model.body_name2id(base_body_name)
         base_pos = np.array(self.sim.data.body_xpos[robot_id])
-        pos_check = np.linalg.norm(self.target_pos[:2] - base_pos[:2]) <= 0.20
+
+        pos_check = (
+            np.linalg.norm(self.target_pos[:2] - base_pos[:2])
+            <= 0.20
+        )
+
         base_ori = T.mat2euler(
             np.array(self.sim.data.body_xmat[robot_id]).reshape((3, 3))
         )

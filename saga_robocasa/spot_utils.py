@@ -463,10 +463,11 @@ def arm_hold_command(raw_env, site_target, rotation_target, position_gain, rotat
     Wrapper arm command that moves the eef site towards a fixed world-frame pose.
 
     The OSC controller (input_type=delta, input_ref_frame=base, goal_update_mode=achieved)
-    sets goal = current eef pose (in the controller origin/base frame) + scaled delta, with
-    the rotation delta applied as an axis-angle in the base frame. World-frame errors are
-    therefore rotated into the controller's origin frame using its own origin_ori, then
-    divided by the controller output scale and clipped.
+    sets goal = current eef pose (in the controller origin frame) + scaled delta, with the
+    rotation delta applied as an axis-angle in that frame. For Spot the origin is the site
+    robot0_right_center on the shoulder-yaw link, so the frame rotates with joint sh0 (it is
+    NOT the base centre frame). World-frame errors are rotated into the controller's origin
+    frame using its own origin_ori, then divided by the controller output scale and clipped.
     Returns (position_command, rotation_command, diagnostics).
     """
     controller = raw_env.robots[0].composite_controller.part_controllers["right"]
@@ -554,3 +555,100 @@ class FrameRecorder:
 
     def close(self):
         self.renderer.close()
+
+
+# --------------------------------------------------------------------------- base actions
+
+
+class BaseActionModel:
+    """
+    Calibrated mapping between wrapper action.base_motion[0:3] and Spot base-frame motion of
+    the base centre site (saga_robocasa/config/base_action_map.json).
+
+    Measured behaviour (SpotWithArmFloating in RoboCasa):
+      - base_motion[0:2] drive the world/anchor-aligned slide joints ([y, x] order), NOT
+        base-frame forward/side;
+      - the slide and yaw joints have frictionloss=250 against kv=1000 velocity actuators, so
+        each joint has a deadband: velocity = sign(u) * max(gain*|u| - deadband, 0);
+      - base_motion[2] yaws about an axis offset from the base centre site, so yawing also
+        translates the site by omega x r.
+    base_motion() inverts this with deadband compensation (|u| >= deadband/gain whenever a
+    non-zero velocity is requested), so commands below the deadband are never produced.
+    """
+
+    def __init__(self, model=None):
+        if model is None:
+            import json
+
+            path = os.path.join(os.path.dirname(__file__), "config", "base_action_map.json")
+            with open(path) as file:
+                model = json.load(file)["model"]
+        self.anchor_yaw = model["anchor_yaw"]
+        self.translation_gain = model["translation_gain"]
+        self.translation_deadband = model["translation_deadband"]
+        self.yaw_gain = model["yaw_gain"]
+        self.yaw_deadband = model["yaw_deadband"]
+        self.offset = np.asarray(model["yaw_axis_to_site_offset_base_frame"])
+
+    def as_dict(self):
+        return {"anchor_yaw": self.anchor_yaw, "translation_gain": self.translation_gain,
+                "translation_deadband": self.translation_deadband, "yaw_gain": self.yaw_gain,
+                "yaw_deadband": self.yaw_deadband, "yaw_axis_to_site_offset_base_frame": self.offset.tolist()}
+
+    @staticmethod
+    def _rotation(angle):
+        c, s = np.cos(angle), np.sin(angle)
+        return np.array([[c, -s], [s, c]])
+
+    @staticmethod
+    def _response(u, gain, deadband):
+        return np.sign(u) * np.maximum(gain * np.abs(u) - deadband, 0.0)
+
+    @staticmethod
+    def _command(velocity, gain, deadband, minimum):
+        if abs(velocity) < minimum:
+            return 0.0
+        return float(np.sign(velocity) * (abs(velocity) + deadband) / gain)
+
+    def _site_offset_velocity(self, omega, base_yaw):
+        return omega * (self._rotation(base_yaw) @ np.array([-self.offset[1], self.offset[0]]))
+
+    def base_velocity(self, base_motion, base_yaw):
+        """base_motion[0:3] -> [forward, side, yaw_rate] of the base centre site in the base frame (steady state)."""
+        u = np.asarray(base_motion, dtype=np.float64)[:3]
+        joint_anchor = np.array([self._response(u[1], self.translation_gain, self.translation_deadband),
+                                 self._response(u[0], self.translation_gain, self.translation_deadband)])
+        omega = float(self._response(u[2], self.yaw_gain, self.yaw_deadband))
+        site_world = self._rotation(self.anchor_yaw) @ joint_anchor + self._site_offset_velocity(omega, base_yaw)
+        forward_side = self._rotation(base_yaw).T @ site_world
+        return np.array([forward_side[0], forward_side[1], omega])
+
+    def base_motion(self, forward, side, yaw_rate, base_yaw, minimum_speed=0.003, minimum_yaw_rate=0.003):
+        """Inverse with deadband compensation: base-frame site velocity and yaw rate -> base_motion[0:3]."""
+        omega = 0.0 if abs(yaw_rate) < minimum_yaw_rate else yaw_rate
+        site_world = self._rotation(base_yaw) @ np.array([forward, side])
+        joint_anchor = self._rotation(self.anchor_yaw).T @ (site_world - self._site_offset_velocity(omega, base_yaw))
+        return np.array([
+            self._command(joint_anchor[1], self.translation_gain, self.translation_deadband, minimum_speed),
+            self._command(joint_anchor[0], self.translation_gain, self.translation_deadband, minimum_speed),
+            self._command(omega, self.yaw_gain, self.yaw_deadband, minimum_yaw_rate),
+        ])
+
+
+# --------------------------------------------------------------------------- policy action conversion
+
+
+def arm_delta_base_to_origin(raw_env, delta_base):
+    """
+    Runtime conversion for a policy that predicts the arm delta in the Spot base frame
+    (base centre site): returns the 6-D normalized OSC input in the live OSC origin frame
+    (site robot0_right_center on the shoulder-yaw link, orientation = base yaw + sh0).
+    Both translation and rotation-vector parts are rotated by R_origin^T R_base. Inverse of
+    the recorder's action_eef_delta_base_frame.
+    """
+    controller = raw_env.robots[0].composite_controller.part_controllers["right"]
+    base_rotation = np.array(raw_env.sim.data.site_xmat[raw_env.sim.model.site_name2id(
+        raw_env.robots[0].robot_model.base.correct_naming("center"))]).reshape(3, 3)
+    base_to_origin = np.asarray(controller.origin_ori).T @ base_rotation
+    delta_base = np.asarray(delta_base, dtype=np.float64)
+    return np.concatenate([base_to_origin @ delta_base[:3], base_to_origin @ delta_base[3:6]])

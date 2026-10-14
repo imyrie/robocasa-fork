@@ -1,0 +1,259 @@
+{
+ "steps": 40,
+ "window": 10,
+ "control_freq": 20.0,
+ "rows": [
+  {
+   "dim": 0,
+   "command": 0.02,
+   "steady_joint_velocity": [
+    0.00039069818654218397,
+    8.877822345424478e-11,
+    -2.6629308029328365e-11
+   ],
+   "dominant_joint": "forward",
+   "gain": 0.019534909327109197,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 0,
+   "command": 0.05,
+   "steady_joint_velocity": [
+    0.000976745494719006,
+    5.491359215141078e-10,
+    -1.0496037239089327e-10
+   ],
+   "dominant_joint": "forward",
+   "gain": 0.019534909894380118,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 0,
+   "command": 0.1,
+   "steady_joint_velocity": [
+    0.001953490961884008,
+    2.1901046647767945e-09,
+    -3.3922616648183157e-10
+   ],
+   "dominant_joint": "forward",
+   "gain": 0.01953490961884008,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 0,
+   "command": 0.2,
+   "steady_joint_velocity": [
+    0.0039069818129449435,
+    8.777616928312906e-09,
+    -1.1966817038103527e-09
+   ],
+   "dominant_joint": "forward",
+   "gain": 0.019534909064724715,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 0,
+   "command": 0.4,
+   "steady_joint_velocity": [
+    0.1499831507342674,
+    6.623184798352784e-07,
+    -1.5338587602627646e-06
+   ],
+   "dominant_joint": "forward",
+   "gain": 0.3749578768356685,
+   "steps_to_90pct": 2
+  },
+  {
+   "dim": 0,
+   "command": 0.7,
+   "steady_joint_velocity": [
+    0.048183941472136185,
+    0.004770169710954474,
+    0.021536055687591912
+   ],
+   "dominant_joint": "forward",
+   "gain": 0.0688342021030517,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 0,
+   "command": 1.0,
+   "steady_joint_velocity": [
+    0.0038983177889759593,
+    0.002798781409095592,
+    0.013107506589137069
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.013107506589137069,
+   "steps_to_90pct": 19
+  },
+  {
+   "dim": 1,
+   "command": 0.02,
+   "steady_joint_velocity": [
+    -7.268541391061844e-12,
+    0.0003616299380392984,
+    -1.5884280064099255e-12
+   ],
+   "dominant_joint": "side",
+   "gain": 0.01808149690196492,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 1,
+   "command": 0.05,
+   "steady_joint_velocity": [
+    -4.4649033288284844e-11,
+    0.0009040748693544987,
+    -2.425349873011423e-12
+   ],
+   "dominant_joint": "side",
+   "gain": 0.018081497387089973,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 1,
+   "command": 0.1,
+   "steady_joint_velocity": [
+    -1.782157830001329e-10,
+    0.0018081497119831313,
+    -1.0466691286637905e-12
+   ],
+   "dominant_joint": "side",
+   "gain": 0.018081497119831313,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 1,
+   "command": 0.2,
+   "steady_joint_velocity": [
+    -7.118004943552947e-10,
+    0.003616299320575967,
+    1.2112079768933438e-11
+   ],
+   "dominant_joint": "side",
+   "gain": 0.018081496602879835,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 1,
+   "command": 0.4,
+   "steady_joint_velocity": [
+    -0.0004060804900866701,
+    3.514689757506675e-05,
+    0.0009156164539062775
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.0022890411347656937,
+   "steps_to_90pct": 22
+  },
+  {
+   "dim": 1,
+   "command": 0.7,
+   "steady_joint_velocity": [
+    -0.0005511097043646911,
+    -5.796492976306816e-05,
+    0.0012432379323206887
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.0017760541890295552,
+   "steps_to_90pct": 8
+  },
+  {
+   "dim": 1,
+   "command": 1.0,
+   "steady_joint_velocity": [
+    -0.0003495799008017695,
+    -8.244141141277725e-05,
+    0.0007889493963026582
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.0007889493963026582,
+   "steps_to_90pct": 5
+  },
+  {
+   "dim": 2,
+   "command": 0.02,
+   "steady_joint_velocity": [
+    -6.723325055890737e-11,
+    2.1684069582605807e-09,
+    0.007136624790094292
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.3568312395047146,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 2,
+   "command": 0.05,
+   "steady_joint_velocity": [
+    7.398473245402765e-12,
+    1.3480475593952153e-08,
+    0.017841564896833837
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.35683129793667673,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 2,
+   "command": 0.1,
+   "steady_joint_velocity": [
+    2.0485486647304414e-09,
+    5.383430299455517e-08,
+    0.03568313949350295
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.35683139493502947,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 2,
+   "command": 0.2,
+   "steady_joint_velocity": [
+    1.7058334796798407e-07,
+    7.348753445585931e-07,
+    0.13333521635822435
+   ],
+   "dominant_joint": "yaw",
+   "gain": 0.6666760817911217,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 2,
+   "command": 0.4,
+   "steady_joint_velocity": [
+    5.828575852670799e-06,
+    5.8859877943525745e-06,
+    0.4333780837840478
+   ],
+   "dominant_joint": "yaw",
+   "gain": 1.0834452094601195,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 2,
+   "command": 0.7,
+   "steady_joint_velocity": [
+    3.540601283631235e-05,
+    1.4810773481049835e-06,
+    0.8835631667284419
+   ],
+   "dominant_joint": "yaw",
+   "gain": 1.2622330953263456,
+   "steps_to_90pct": 0
+  },
+  {
+   "dim": 2,
+   "command": 1.0,
+   "steady_joint_velocity": [
+    5.120905329051709e-05,
+    -3.96991604519074e-05,
+    1.3336650253848767
+   ],
+   "dominant_joint": "yaw",
+   "gain": 1.3336650253848767,
+   "steps_to_90pct": 0
+  }
+ ]
+}

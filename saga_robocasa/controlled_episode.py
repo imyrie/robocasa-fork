@@ -16,6 +16,11 @@ spawn and object placement all change. Instead this module:
      at the reference target's XY, resting on the same support height (its collision
      bottom placed on the reference object's collision bottom), keeping its replayed
      orientation.
+
+Reproducibility: RoboCasa's Counter fixture colours its collision boxes with the *global,
+unseeded* np.random (robocasa/models/fixtures/counter.py), so rendered counter colours
+differed between otherwise identical resets. Every reset here seeds np.random with the
+episode seed first, and policy cameras hide collision geoms (policy_cameras.py).
 """
 
 import copy
@@ -64,9 +69,13 @@ def object_free_joint(raw_env, name):
 
 
 class ControlledEpisode:
-    def __init__(self, seed=0, object_xml=None, **make_kwargs):
+    def __init__(self, seed=0, object_xml=None, policy_camera=False, **make_kwargs):
         self.seed = seed
         self.object_xml = object_xml
+        if policy_camera:
+            from policy_cameras import register_external_camera
+
+            register_external_camera()
         kwargs = dict(
             robots="SpotWithArmFloating", split="pretrain",
             render_camera=["robot0_eye_in_hand"], camera_names=["robot0_eye_in_hand"],
@@ -75,6 +84,7 @@ class ControlledEpisode:
         kwargs.update(make_kwargs)
         self.env = gym.make(TASK, **kwargs)
 
+        np.random.seed(seed)
         self.env.reset(seed=seed)
         raw_env = self.raw_env
         self.reference = {
@@ -100,6 +110,7 @@ class ControlledEpisode:
 
     def reset(self):
         """Reset to the controlled episode and return a placement report."""
+        np.random.seed(self.seed)  # RoboCasa counter collision colours use the global RNG
         if self.object_xml is None:
             self.env.reset(seed=self.seed)
             return {"pinned": False}

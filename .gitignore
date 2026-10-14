@@ -176,3 +176,5 @@ saga_robocasa/trajectories/*.json
 !saga_robocasa/trajectories/.gitkeep
 
 saga_robocasa/probes/
+
+saga_robocasa/data/

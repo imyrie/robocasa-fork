@@ -1,0 +1,80 @@
+{
+ "model": {
+  "anchor_yaw": -1.8344647019441496e-05,
+  "translation_gain": 1.0,
+  "translation_deadband": 0.25,
+  "yaw_gain": 1.502,
+  "yaw_deadband": 0.168,
+  "yaw_axis_to_site_offset_base_frame": [
+   0.2897088930558859,
+   0.030799061992560287
+  ],
+  "translation_command_order": "base_motion[0] -> anchor +y slide joint, base_motion[1] -> anchor +x slide joint"
+ },
+ "model_form": "joint velocity = sign(u) * max(gain*|u| - deadband, 0) per slide joint (anchor frame) and for yaw",
+ "provenance": {
+  "translation": "floating_legged_base.xml: velocity actuators kv=1000 (ctrlrange +/-1 m/s), joint frictionloss=250 N -> static friction overcome only when kv*u > 250, i.e. |u| > 0.25; steady state v ~= u - 0.25. Consistent with calibrate_base_action.py (u=0.3 -> 0.046-0.05 m/s) and calibrate_base_response.py.",
+  "yaw": "least-squares fit to calibrate_base_response.py steady yaw rates (u=0.2..1.0): v ~= 1.502*u - 0.168 rad/s",
+  "frame_and_offset": "calibrate_base_action.py: commands are anchor-frame [y, x] slide velocities (heading independent to 3e-4); yaw axis offset from the base centre site fitted from yaw-induced site motion"
+ },
+ "frame_calibration": {
+  "model_max_abs_error": {
+   "0.0": 0.00029361467813230875,
+   "0.6": 0.00025116534385258293
+  },
+  "measured_matrices": {
+   "0.0": [
+    [
+     -0.00029361467813230875,
+     0.15391339147008043,
+     -0.028995448859544543
+    ],
+    [
+     0.15387364134936427,
+     0.0002906747662993046,
+     0.27274335156006796
+    ],
+    [
+     -0.00013891750424459322,
+     -1.1592894997218396e-05,
+     0.941439348592778
+    ]
+   ],
+   "0.6": [
+    [
+     0.08666459088330664,
+     0.12719725818450894,
+     -0.028997241653824057
+    ],
+    [
+     0.12716195843016945,
+     -0.0866436504011925,
+     0.2727939610975593
+    ],
+    [
+     -0.00012121206497628378,
+     6.869510283773966e-05,
+     0.9414393460843303
+    ]
+   ]
+  },
+  "rows": [
+   "forward_rate",
+   "side_rate (left)",
+   "yaw_rate (ccw)"
+  ],
+  "columns": [
+   "base_motion[0]",
+   "base_motion[1]",
+   "base_motion[2]"
+  ],
+  "units": "m/s or rad/s per unit of normalized base_motion command",
+  "heading_independence_max_abs_difference": 0.08695820556143895,
+  "measured_with": {
+   "steps": 15,
+   "command": 0.3,
+   "episode": "controlled seed-0, pregrasp base pose",
+   "headings": "anchor yaw + {0.0, 0.6} rad"
+  }
+ }
+}

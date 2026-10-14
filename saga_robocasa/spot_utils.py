@@ -7,6 +7,8 @@ Frames:
     expressed as (forward, left, up).
 """
 
+import os
+
 import gymnasium as gym
 import mujoco
 import numpy as np
@@ -383,6 +385,7 @@ def solve_arm_ik(
     tcp_offset_local=TCP_OFFSET_LOCAL,
     approach_world=None,
     approach_local=APPROACH_LOCAL,
+    rotation_world=None,
     initial_qpos=None,
     iterations=400,
     damping=0.05,
@@ -394,7 +397,8 @@ def solve_arm_ik(
 
     Drives the tool point (eef site + tcp_offset_local) to `target_position`. If
     `approach_world` is given, the eef-site axis `approach_local` is also aligned with
-    it (2-DoF pointing constraint). Joints are clipped to limits shrunk by
+    it (2-DoF pointing constraint). If `rotation_world` is given instead, the full eef-site
+    rotation is constrained (3-DoF). Joints are clipped to limits shrunk by
     `limit_margin`. Returns (qpos, info).
     """
     model = raw_env.sim.model._model
@@ -420,7 +424,11 @@ def solve_arm_ik(
         point = tool_point()
         mujoco.mj_jac(model, scratch, jacp, jacr, point, site_body)
         errors, jacobians = [target_position - point], [jacp[:, dof_index].copy()]
-        if approach_world is not None:
+        if rotation_world is not None:
+            current = scratch.site_xmat[site_id].reshape(3, 3)
+            errors.append(orientation_weight * Rotation.from_matrix(rotation_world @ current.T).as_rotvec())
+            jacobians.append(orientation_weight * jacr[:, dof_index])
+        elif approach_world is not None:
             axis = scratch.site_xmat[site_id].reshape(3, 3) @ approach_local
             errors.append(orientation_weight * np.cross(axis, approach_world))
             jacobians.append(orientation_weight * jacr[:, dof_index])
@@ -433,7 +441,10 @@ def solve_arm_ik(
 
     mujoco.mj_kinematics(model, scratch)
     info = {"position_error": float(np.linalg.norm(target_position - tool_point()))}
-    if approach_world is not None:
+    if rotation_world is not None:
+        current = scratch.site_xmat[site_id].reshape(3, 3)
+        info["rotation_error_rad"] = float(np.linalg.norm(Rotation.from_matrix(rotation_world @ current.T).as_rotvec()))
+    elif approach_world is not None:
         axis = scratch.site_xmat[site_id].reshape(3, 3) @ approach_local
         info["approach_error_rad"] = float(np.arccos(np.clip(np.dot(axis, approach_world), -1.0, 1.0)))
     qpos = scratch.qpos[qpos_index].copy()
@@ -500,3 +511,46 @@ def render_free_camera(raw_env, path, look_at, azimuth_deg, elevation_deg=-25.0,
     renderer.update_scene(data, camera=camera)
     Image.fromarray(renderer.render()).save(path)
     renderer.close()
+
+
+class FrameRecorder:
+    """
+    Persistent external free-camera renderer that saves one JPEG per recorded step
+    (progress videos only; not policy observations).
+    """
+
+    def __init__(self, raw_env, directory, look_at, azimuth_deg, elevation_deg=-25.0,
+                 distance=1.8, size=480, quality=90):
+        from PIL import Image  # noqa: F401  (fail early if unavailable)
+
+        os.makedirs(directory, exist_ok=True)
+        self.raw_env, self.directory, self.quality = raw_env, directory, quality
+        model = raw_env.sim.model._model
+        model.vis.global_.offwidth = max(model.vis.global_.offwidth, size)
+        model.vis.global_.offheight = max(model.vis.global_.offheight, size)
+        self.renderer = mujoco.Renderer(model, height=size, width=size)
+        self.camera = mujoco.MjvCamera()
+        self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self.camera.lookat[:] = look_at
+        self.camera.distance, self.camera.elevation, self.camera.azimuth = distance, elevation_deg, azimuth_deg
+        self.count = 0
+
+    def capture(self):
+        from PIL import Image
+
+        self.renderer.update_scene(self.raw_env.sim.data._data, camera=self.camera)
+        path = os.path.join(self.directory, f"frame_{self.count:05d}.jpg")
+        Image.fromarray(self.renderer.render()).save(path, quality=self.quality)
+        self.count += 1
+        return path
+
+    def write_video(self, path, fps=20):
+        import imageio.v2 as imageio
+
+        with imageio.get_writer(path, fps=fps, codec="libx264", quality=8) as writer:
+            for index in range(self.count):
+                writer.append_data(imageio.imread(os.path.join(self.directory, f"frame_{index:05d}.jpg")))
+        return path
+
+    def close(self):
+        self.renderer.close()

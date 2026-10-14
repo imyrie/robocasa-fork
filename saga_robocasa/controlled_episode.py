@@ -1,6 +1,12 @@
 """
 Controlled PickPlaceCounterToSink episode: the seed-0 layout with a pinned target object.
 
+IMPORTANT: this is a fixed, hand-constructed *controlled benchmark episode*, not an
+unmodified, randomly sampled RoboCasa episode. It replays the seed-0 episode metadata and
+then replaces the target object model and repositions it (and restores the distractor
+poses). Results obtained here should be reported as results on this controlled episode,
+not as RoboCasa PickPlaceCounterToSink success rates.
+
 Passing obj_groups=<xml path> to gym.make changes the random draws, so the layout, robot
 spawn and object placement all change. Instead this module:
   1. resets the default task with the reference seed and records its episode metadata

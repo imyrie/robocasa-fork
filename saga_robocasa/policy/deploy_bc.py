@@ -9,7 +9,11 @@ desired base-frame base velocity, gripper) is converted to env inputs with the v
 spot_utils.arm_delta_base_to_origin and BaseActionModel.base_motion (deadband compensation).
 
 Safety: fixed maximum horizon; abort on unexpected robot contact (collision), joint-limit
-proximity, or object drop. Reports navigation error, grasp success, placement success and the
+proximity, or object drop. Optional deployment-only safety filter (--safety-filter, the model is
+unchanged): each normalized action component is clipped to the training range ([-1, 1] by
+construction of the min/max normalization) and rate-limited to the largest step-to-step change
+observed in the training actions of the source demo(s). Raw, clipped and executed predictions are
+all logged. This is a diagnostic, not a fix for behavior cloning. Reports navigation error, grasp success, placement success and the
 final raw_env._check_success(). Saves the evaluation trajectory and an external-camera video.
 
     python -u saga_robocasa/policy/deploy_bc.py saga_robocasa/data/checkpoints/bc_overfit_nav_000.pt \
@@ -62,6 +66,10 @@ def main():
     parser.add_argument("--name", default="eval")
     parser.add_argument("--max-steps", type=int, default=1200)
     parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument("--safety-filter", action="store_true",
+                        help="Clip normalized predictions to the training range and rate-limit them.")
+    parser.add_argument("--rate-demos", nargs="*", default=None,
+                        help="Demos whose actions define the per-step rate limit (default: the checkpoint's demos via --demo).")
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
 
@@ -72,7 +80,17 @@ def main():
                              for k, v in meta["expert_config"].items() if k in fields})
     model, stats, checkpoint = load_policy(args.checkpoint)
     num_points, seed = checkpoint["preprocessing"]["num_points"], checkpoint["preprocessing"]["seed"]
-    gripper_scale = (stats["action_low"][9], stats["action_span"][9])
+    rate_limit = None
+    if args.safety_filter:
+        sources = args.rate_demos or [args.demo]
+        normalized_actions = []
+        for source in sources:
+            with np.load(source + ".npz") as archive:
+                actions = archive["action_policy"]
+            normalized_actions.append(2.0 * (actions - stats["action_low"]) / stats["action_span"] - 1.0)
+        rate_limit = np.max(np.concatenate([np.abs(np.diff(a, axis=0)) for a in normalized_actions]), axis=0)
+        print("Safety filter: clip normalized actions to [-1, 1]; per-step rate limit (normalized):",
+              np.round(rate_limit, 4).tolist())
 
     episode = ControlledEpisode(config.seed, meta["object_xml"], policy_camera=True)
     if meta.get("navigation"):
@@ -95,16 +113,32 @@ def main():
 
     goal_xy, goal_yaw = start["base_xy"], start["base_yaw"]
     object_start_z = float(fsm.can_state()["position"][2])
-    log = {"predicted": [], "wrapper_eef": [], "wrapper_base": [], "gripper_command": [], "base_error": [],
+    log = {"predicted_raw": [], "predicted_clipped": [], "predicted": [], "wrapper_eef": [], "wrapper_base": [], "gripper_command": [], "base_error": [],
            "yaw_error": [], "object_position": [], "jaws": []}
     status, reason, grasped, first_close_step, no_contact_steps = "timeout", f"max steps {args.max_steps}", False, None, 0
+    previous_normalized = None
+    clip_events, rate_events = 0, 0
     wrapper_obs = episode.env.unwrapped.get_observation(raw_env._get_observations(force_update=True))
     for t in range(args.max_steps):
         recorder.observe(wrapper_obs, fsm)
         points, proprio, goal = preprocess(recorder, stats, t, num_points, seed)
         with torch.no_grad():
-            normalized = model(points, proprio, goal).numpy()[0, 0]
-        predicted = (normalized + 1.0) / 2.0 * stats["action_span"] + stats["action_low"]
+            raw = model(points, proprio, goal).numpy()[0, 0]
+        normalized = raw
+        clipped = raw
+        if rate_limit is not None:
+            clipped = np.clip(raw, -1.0, 1.0)
+            clip_events += int(np.any(clipped != raw))
+            normalized = clipped
+            if previous_normalized is not None:
+                limited = np.clip(clipped, previous_normalized - rate_limit, previous_normalized + rate_limit)
+                rate_events += int(np.any(limited != clipped))
+                normalized = limited
+            previous_normalized = normalized
+        denormalize = lambda x: (x + 1.0) / 2.0 * stats["action_span"] + stats["action_low"]  # noqa: E731
+        predicted = denormalize(normalized)
+        log["predicted_raw"].append(denormalize(raw))
+        log["predicted_clipped"].append(denormalize(clipped))
         _, base_yaw = SU.base_pose(raw_env)
 
         action = SU.zero_action(episode.env)
@@ -169,6 +203,9 @@ def main():
                        "yaw_error_at_first_close_rad": None if first_close_step is None else float(log["yaw_error"][first_close_step]),
                        "first_close_step": first_close_step},
         "grasp_success": grasped, "placement_success": placed, "final_check_success": final_success,
+        "safety_filter": None if rate_limit is None else {
+            "clip": "normalized [-1, 1] (training min/max)", "rate_limit_normalized": rate_limit.tolist(),
+            "steps_with_clipping": clip_events, "steps_with_rate_limiting": rate_events},
     }
     print("\n" + json.dumps(report, indent=1))
     os.makedirs(out_dir, exist_ok=True)

@@ -56,7 +56,7 @@ import policy_cameras as PC
 import spot_utils as SU
 from controlled_episode import DEFAULT_OBJECT_XML, ControlledEpisode
 from expert_fsm import ExpertAbort, ExpertConfig, ExpertFSM, prepare_start
-from nav_expert import PHASES, NavConfig, NavExpertFSM, prepare_navigation_start
+from nav_expert import PHASES, NavConfig, NavExpertFSM, prepare_navigation_start, prepare_restored_start
 
 
 DATA_ROOT = os.path.join(os.path.dirname(__file__), "data")
@@ -232,6 +232,13 @@ def main():
     parser.add_argument("--navigate", action="store_true",
                         help="Start from a farther base pose and navigate (A*) to the pregrasp pose first.")
     parser.add_argument("--nav-start-seed", type=int, default=0)
+    parser.add_argument("--nav-start-mode", choices=["far", "near"], default="far")
+    parser.add_argument("--restore-from", default=None,
+                        help="DAgger recovery: policy rollout .npz whose visited state to restore (implies --navigate).")
+    parser.add_argument("--restore-step", type=int, default=None)
+    parser.add_argument("--restore-reason", default=None, help="Why this state was chosen (stored in metadata).")
+    parser.add_argument("--nav-near-distance", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+    parser.add_argument("--nav-near-yaw", type=float, default=None)
     parser.add_argument("--subdir", default="demos", help="Output subdirectory for successful episodes.")
     for field in dataclasses.fields(ExpertConfig):
         if isinstance(field.default, (int, float)) and not isinstance(field.default, bool):
@@ -243,8 +250,19 @@ def main():
     episode = ControlledEpisode(config.seed, args.object_xml, policy_camera=True)
     raw_env = episode.raw_env
     nav_config, nav_plan = None, None
-    if args.navigate:
+    if args.restore_from:
+        args.navigate = True
         nav_config = NavConfig(start_seed=args.nav_start_seed)
+        start, nav_plan = prepare_restored_start(episode, config, nav_config, args.restore_from, args.restore_step)
+        print(f"Restored state from {args.restore_from} step {args.restore_step}: base "
+              f"{np.round(nav_plan['xy'], 3).tolist()} yaw offset {nav_plan['yaw_offset']:.3f}, "
+              f"{nav_plan['distance']:.3f} m from pregrasp")
+    elif args.navigate:
+        nav_config = NavConfig(start_seed=args.nav_start_seed, start_mode=args.nav_start_mode)
+        if args.nav_near_distance is not None:
+            nav_config.near_distance_min, nav_config.near_distance_max = args.nav_near_distance
+        if args.nav_near_yaw is not None:
+            nav_config.near_yaw = args.nav_near_yaw
         start, nav_plan = prepare_navigation_start(episode, config, nav_config)
         print(f"Navigation start {np.round(nav_plan['xy'], 3).tolist()} yaw {nav_plan['yaw']:.3f}, "
               f"{nav_plan['distance']:.2f} m from pregrasp, {len(nav_plan['path'])} waypoints")
@@ -334,6 +352,9 @@ def main():
             "config": dataclasses.asdict(nav_config), "start_xy": nav_plan["xy"].tolist(), "start_yaw": nav_plan["yaw"],
             "path": [list(map(float, p)) for p in nav_plan["path"]], "distance": nav_plan["distance"],
             "start_base_clearance": nav_plan["base_clearance"], "start_robot_clearance": nav_plan["robot_clearance"],
+            "start_mode": nav_plan.get("mode"), "start_yaw_offset": nav_plan.get("yaw_offset"),
+            "restored_from": args.restore_from, "restored_step": args.restore_step,
+            "restore_reason": args.restore_reason, "restored_gripper_ramp": nav_plan.get("restored_gripper_ramp"),
             "goal_xy": start["base_xy"].tolist(), "goal_yaw": float(start["base_yaw"])},
         "base_action_model": base_model.as_dict(),
         "base_velocity_scale": BASE_VELOCITY_SCALE.tolist(),

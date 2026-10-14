@@ -45,6 +45,15 @@ class NavConfig:
     start_seed: int = 0
     start_min_base_clearance: float = 0.15
     start_min_robot_clearance: float = 0.10
+    # Start-pose sampling mode: "far" (behind the pregrasp pose, start_distance_*) or "near"
+    # (near_distance_* from the pregrasp pose in any direction, yaw offset within +/- near_yaw).
+    start_mode: str = "far"
+    far_bearing_halfwidth: float = 1.2
+    far_yaw_halfwidth: float = 1.5708
+    near_distance_min: float = 0.01
+    near_distance_max: float = 0.10
+    near_yaw: float = 0.15
+    near_min_base_clearance: float = 0.08
     grid_resolution: float = 0.10
     transit_clearance: float = 0.38
     endpoint_clearance: float = 0.25
@@ -171,12 +180,21 @@ def choose_start_pose(episode, start, config, nav_config):
     goal_xy, goal_yaw = start["base_xy"], start["base_yaw"]
     model, data = raw_env.sim.model._model, raw_env.sim.data._data
     tried = []
+    near = nav_config.start_mode == "near"
+    minimum_base_clearance = nav_config.near_min_base_clearance if near else nav_config.start_min_base_clearance
     for _ in range(nav_config.start_candidates):
-        distance = rng.uniform(nav_config.start_distance_min, nav_config.start_distance_max)
-        bearing = goal_yaw + np.pi + rng.uniform(-1.2, 1.2)  # mostly behind the pregrasp pose
+        if near:
+            distance = rng.uniform(nav_config.near_distance_min, nav_config.near_distance_max)
+            bearing = rng.uniform(-np.pi, np.pi)
+            yaw = goal_yaw + rng.uniform(-nav_config.near_yaw, nav_config.near_yaw)
+        else:
+            distance = rng.uniform(nav_config.start_distance_min, nav_config.start_distance_max)
+            bearing = goal_yaw + np.pi + rng.uniform(-nav_config.far_bearing_halfwidth, nav_config.far_bearing_halfwidth)
+            yaw = goal_yaw + rng.uniform(-nav_config.far_yaw_halfwidth, nav_config.far_yaw_halfwidth)
         xy = goal_xy + distance * np.array([np.cos(bearing), np.sin(bearing)])
-        yaw = goal_yaw + rng.uniform(-np.pi / 2, np.pi / 2)
-        if footprint_blocked(raw_env, xy, nav_config.transit_clearance):
+        # Near-goal starts sit next to the counter like the goal itself; rely on the exact
+        # clearance check below instead of the conservative footprint ring.
+        if not near and footprint_blocked(raw_env, xy, nav_config.transit_clearance):
             continue
         SU.teleport_base(raw_env, xy, yaw)
         SU.set_arm_qpos(raw_env, start["ready_qpos"])
@@ -185,7 +203,7 @@ def choose_start_pose(episode, start, config, nav_config):
         scene, self_contact = SU.robot_contacts(model, data)
         robot_clearance = min(clearance["arm"]["distance"], clearance["gripper"]["distance"])
         tried.append((xy, yaw, clearance["base"]["distance"], robot_clearance))
-        if (clearance["base"]["distance"] < nav_config.start_min_base_clearance
+        if (clearance["base"]["distance"] < minimum_base_clearance
                 or robot_clearance < nav_config.start_min_robot_clearance or scene or self_contact):
             continue
         planner = GridPlanner(raw_env, xy, goal_xy, nav_config)
@@ -193,6 +211,7 @@ def choose_start_pose(episode, start, config, nav_config):
         if path is None:
             continue
         return {"xy": xy, "yaw": float(yaw), "path": path, "distance": float(np.linalg.norm(xy - goal_xy)),
+                "yaw_offset": float(np.angle(np.exp(1j * (yaw - goal_yaw)))), "mode": nav_config.start_mode,
                 "base_clearance": clearance["base"]["distance"], "robot_clearance": robot_clearance,
                 "candidates_checked": len(tried), "grid_shape": list(planner.blocked.shape)}
     raise ExpertAbort("NAV_PLAN", f"no collision-free reachable start pose among {len(tried)} checked candidates")
@@ -334,3 +353,53 @@ class NavExpertFSM(ExpertFSM):
     def commands(self):
         yield from self.navigation()
         yield from super().commands()
+
+
+def prepare_restored_start(episode, config, nav_config, rollout_path, step):
+    """
+    DAgger-style recovery start: compute the validated pregrasp target with prepare_start(), then
+    restore the exact simulator state (qpos, qvel) that a policy rollout visited at `step`
+    (rollout recorded by policy/deploy_bc.py through record_expert_demo.Recorder), sync the
+    controllers, and plan navigation from that pose. The BD gripper's internal ramp state is not
+    part of the simulator state; it is set from the rollout's last gripper command.
+    Returns (start, nav_plan).
+    """
+    start = prepare_start(episode, config)
+    raw_env = episode.raw_env
+    with np.load(rollout_path) as archive:
+        qpos, qvel = archive["obs_sim_qpos"][step], archive["obs_sim_qvel"][step]
+        commands = archive["eval_gripper_command"]
+    raw_env.sim.data.qpos[:] = qpos
+    raw_env.sim.data.qvel[:] = qvel
+    raw_env.sim.forward()
+    SU.sync_controllers(raw_env)
+    last_close = step > 0 and commands[step - 1] > 0.5
+    raw_env.robots[0].gripper["right"].current_action = np.array([1.0 if last_close else -1.0])
+    # Re-derive the grasp targets from the object's current pose (the policy may have moved it).
+    from expert_fsm import FINGERTIP_BELOW_TCP, FINGERTIP_CLEARANCE
+    from controlled_episode import object_collision_bottom
+
+    object_origin = np.array(raw_env.sim.data.body_xpos[raw_env.obj_body_id["obj"]])
+    object_bottom = object_collision_bottom(raw_env, "obj")
+    closing_axis = start["ready_rotation"][:, 0]
+    alignment = -config.object_center_site_x * np.array([closing_axis[0], closing_axis[1], 0.0])
+    grasp_z = max(object_origin[2], object_bottom + FINGERTIP_BELOW_TCP + FINGERTIP_CLEARANCE)
+    object_shift = float(np.linalg.norm(object_origin - start["object_origin"]))
+    start.update(object_origin=object_origin, object_bottom=object_bottom,
+                 hover_tcp=object_origin + np.array([0.0, 0.0, config.hover_height]) + alignment,
+                 grasp_tcp=np.array([object_origin[0], object_origin[1], grasp_z]) + alignment)
+    base_position, base_yaw = SU.base_pose(raw_env)
+    planner = GridPlanner(raw_env, base_position[:2], start["base_xy"], nav_config)
+    path = planner.plan()
+    if path is None:
+        raise ExpertAbort("NAV_PLAN", "no A* path from the restored state")
+    model, data = raw_env.sim.model._model, raw_env.sim.data._data
+    clearance = SU.clearance_report(model, data, base_position)
+    nav_plan = {"xy": base_position[:2].copy(), "yaw": float(base_yaw), "path": path,
+                "distance": float(np.linalg.norm(base_position[:2] - start["base_xy"])),
+                "yaw_offset": float(np.angle(np.exp(1j * (base_yaw - start["base_yaw"])))),
+                "base_clearance": clearance["base"]["distance"],
+                "robot_clearance": min(clearance["arm"]["distance"], clearance["gripper"]["distance"]),
+                "mode": "restored", "candidates_checked": 0, "grid_shape": list(planner.blocked.shape),
+                "restored_gripper_ramp": 1.0 if last_close else -1.0, "object_shift_since_reset": object_shift}
+    return start, nav_plan

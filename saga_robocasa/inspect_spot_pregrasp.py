@@ -15,13 +15,13 @@ import itertools
 import json
 import os
 
-import gymnasium as gym
 import mujoco
 import numpy as np
 import robocasa  # noqa: F401
 from PIL import Image
 
 import spot_utils as SU
+from controlled_episode import ControlledEpisode
 
 
 TASK = "robocasa/PickPlaceCounterToSink"
@@ -234,19 +234,21 @@ def render_candidate(raw_env, initial_state, result, qpos, path, size=512):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--object-xml", default=None,
+                        help="Pin the target object (mjcf path) into the seed's layout via ControlledEpisode.")
     parser.add_argument("--base-clearance-min", type=float, default=0.10)
     parser.add_argument("--backoffs", type=float, nargs="+", default=[0.05, 0.075, 0.10, 0.125, 0.15, 0.175, 0.20])
     parser.add_argument("--lateral", type=float, nargs="+", default=[0.0, -0.04, -0.08])
     parser.add_argument("--output-dir", default=os.path.join(os.path.dirname(__file__), "probes", "pregrasp_seed0"))
     args = parser.parse_args()
 
-    env = gym.make(
-        TASK, robots="SpotWithArmFloating", split="pretrain",
-        render_camera=["robot0_eye_in_hand"], camera_names=["robot0_eye_in_hand"],
-        render_gpu_device_id=0, seed=args.seed,
-    )
-    env.reset(seed=args.seed)
-    raw_env = env.unwrapped.env
+    episode = ControlledEpisode(args.seed, args.object_xml)
+    env = episode.env
+    placement = episode.reset()
+    if placement.get("pinned"):
+        episode.settle_objects()
+    print("Placement:", json.dumps(placement, default=float))
+    raw_env = episode.raw_env
     model = raw_env.sim.model._model
 
     approach_local, tcp_offset_local = report_conventions(raw_env, env)
@@ -326,7 +328,7 @@ def main():
     with open(os.path.join(args.output_dir, "candidates.json"), "w") as file:
         json.dump(results, file, indent=2)
     print("Saved", os.path.join(args.output_dir, "candidates.json"))
-    env.close()
+    episode.close()
 
 
 if __name__ == "__main__":

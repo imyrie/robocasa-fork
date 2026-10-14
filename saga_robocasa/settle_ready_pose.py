@@ -24,14 +24,13 @@ import argparse
 import json
 import os
 
-import gymnasium as gym
 import numpy as np
 import robocasa  # noqa: F401
 
 import spot_utils as SU
+from controlled_episode import ControlledEpisode
 
 
-TASK = "robocasa/PickPlaceCounterToSink"
 TOP_DOWN = np.array([0.0, 0.0, -1.0])
 
 # Pass criteria for the closed-loop hold phase.
@@ -49,12 +48,12 @@ class ContactAbort(Exception):
     pass
 
 
-def make_env(seed):
-    return gym.make(
-        TASK, robots="SpotWithArmFloating", split="pretrain",
-        render_camera=["robot0_eye_in_hand"], camera_names=["robot0_eye_in_hand"],
-        render_gpu_device_id=0, seed=seed,
-    )
+def reset_episode(episode):
+    """Reset the (optionally object-pinned) controlled episode; settle pinned objects."""
+    placement = episode.reset()
+    if placement.get("pinned"):
+        episode.settle_objects()
+    return placement
 
 
 def to_list(value):
@@ -64,10 +63,10 @@ def to_list(value):
 # --------------------------------------------------------------------------- scene setup
 
 
-def scene_reference(env, seed, base_backoff, base_lateral):
-    """Spawn pose, object position, and pregrasp base pose for this seed (deterministic)."""
-    env.reset(seed=seed)
-    raw_env = env.unwrapped.env
+def scene_reference(episode, base_backoff, base_lateral):
+    """Spawn pose, object position, and pregrasp base pose for this episode (deterministic)."""
+    placement = reset_episode(episode)
+    raw_env = episode.raw_env
     spawn_position, spawn_yaw = SU.base_pose(raw_env)
     object_position = np.array(raw_env.sim.data.body_xpos[raw_env.obj_body_id["obj"]])
     base_xy = SU.base_to_world([-base_backoff, base_lateral, 0.0], spawn_position, spawn_yaw)[:2]
@@ -78,13 +77,14 @@ def scene_reference(env, seed, base_backoff, base_lateral):
         "base_xy": base_xy,
         "base_yaw": spawn_yaw,
         "instruction": raw_env.get_ep_meta()["lang"],
+        "placement": placement,
     }
 
 
-def place_robot(env, seed, reference, arm_qpos):
+def place_robot(episode, reference, arm_qpos):
     """Steps 1-3: reset, teleport base and arm, forward, sync controllers."""
-    env.reset(seed=seed)
-    raw_env = env.unwrapped.env
+    reset_episode(episode)
+    raw_env = episode.raw_env
     SU.teleport_base(raw_env, reference["base_xy"], reference["base_yaw"])
     SU.set_arm_qpos(raw_env, arm_qpos)
     raw_env.sim.forward()
@@ -106,63 +106,75 @@ def controller_sync_report(raw_env):
 # --------------------------------------------------------------------------- TCP validation
 
 
-def validate_tcp(env, seed, reference, configurations, object_radius):
+def validate_tcp(episode, reference, configurations, object_width, grasp_tcp_above_bottom, object_height):
     """
-    Validate the fixed TCP (site + 0.208 m along site -z) against the jaw geometry:
-      - rigid jaw boxes must not move in the site frame across arm configurations;
-      - with the gripper open, the TCP must lie strictly between the fixed-jaw and
-        moving-jaw inner faces (site x) and inside the jaw y/z extent.
-    Also reports where an object of `object_radius`, centred on the TCP, would sit relative
-    to the fixed jaw (the moving jaw pushes the object against the fixed jaw on closing).
+    Validate the fixed TCP (grip site + 0.208 m along site -z) against the jaw geometry.
+
+    The object occupies, in the grip-site frame during the grasp, the height interval
+    [tcp_z - grasp_tcp_above_bottom, tcp_z - grasp_tcp_above_bottom + object_height]
+    (site z decreases along the approach). Over that interval, and with the gripper fully
+    open (joint limit), the free channel between the fixed and moving jaws must exceed the
+    object width, and the TCP must lie inside the channel and the jaw extent. Rigid jaw
+    geometry must not move in the site frame across arm configurations. A gripper sweep
+    from open to closed is reported for the first configuration.
     """
-    env.reset(seed=seed)
-    raw_env = env.unwrapped.env
+    reset_episode(episode)
+    raw_env = episode.raw_env
     SU.teleport_base(raw_env, reference["base_xy"], reference["base_yaw"])
     gripper_index = SU.gripper_qpos_index(raw_env)
-    open_qpos = raw_env.sim.data.qpos[gripper_index].copy()
-    closed_qpos = np.zeros_like(open_qpos)
+    observed_qpos = raw_env.sim.data.qpos[gripper_index].copy()
     tcp = SU.TCP_OFFSET_LOCAL
+    # Site z grows opposite to the approach (approach = -z), so lower in the world = more negative z.
+    z_low = tcp[2] - grasp_tcp_above_bottom
+    z_high = z_low + object_height
 
-    rows, reference_boxes, max_motion = [], None, 0.0
-    for label, arm_qpos in configurations.items():
-        boxes = {}
-        for gripper_label, gripper_qpos in (("open", open_qpos), ("closed", closed_qpos)):
-            SU.set_arm_qpos(raw_env, arm_qpos)
-            raw_env.sim.data.qpos[gripper_index] = gripper_qpos
-            raw_env.sim.forward()
-            boxes[gripper_label] = SU.finger_geom_vertices(raw_env)
-        analysis = SU.jaw_analysis(boxes["open"], boxes["closed"], z_center=tcp[2])
-        if "error" in analysis:
-            rows.append({"configuration": label, "tcp_inside_open_jaws": False, **analysis})
-            continue
-        if reference_boxes is None:
-            reference_boxes = boxes
-        for state in ("open", "closed"):
-            for mesh, points in boxes[state].items():
-                max_motion = max(max_motion, np.abs(points - reference_boxes[state][mesh]).max())
-        lo_x = min(analysis["fixed_inner_face_x"], analysis["moving_inner_face_x_open"])
-        hi_x = max(analysis["fixed_inner_face_x"], analysis["moving_inner_face_x_open"])
+    rows, reference_vertices, max_motion, sweep = [], None, 0.0, []
+    for index, (label, arm_qpos) in enumerate(configurations.items()):
+        SU.set_arm_qpos(raw_env, arm_qpos)
+        raw_env.sim.data.qpos[gripper_index] = SU.GRIPPER_OPEN_QPOS
+        raw_env.sim.forward()
+        vertices = SU.finger_geom_vertices(raw_env)
+        if reference_vertices is None:
+            reference_vertices = vertices
+        max_motion = max(max_motion, max(np.abs(vertices[m] - reference_vertices[m]).max() for m in vertices))
+        channel = SU.jaw_channel(raw_env, z_low, z_high)
+        lower = channel["fixed_inner_face_x"]
+        upper = channel["moving_inner_face_x"]
+        if channel["fixed_on_negative_x"]:
+            inside_x = lower is not None and tcp[0] > lower and (upper is None or tcp[0] < upper)
+        else:
+            inside_x = lower is not None and tcp[0] < lower and (upper is None or tcp[0] > upper)
         inside = bool(
-            lo_x < tcp[0] < hi_x
-            and analysis["jaw_y_range"][0] <= tcp[1] <= analysis["jaw_y_range"][1]
-            and analysis["jaw_z_range"][0] <= tcp[2] <= analysis["jaw_z_range"][1]
+            inside_x
+            and channel["jaw_y_range"][0] <= tcp[1] <= channel["jaw_y_range"][1]
+            and channel["jaw_z_range"][0] <= tcp[2] <= channel["jaw_z_range"][1]
         )
-        rows.append({"configuration": label, "tcp_inside_open_jaws": inside, **analysis})
+        rows.append({"configuration": label, "tcp_inside_open_jaws": inside,
+                     "fits": bool(channel["channel_width"] >= object_width + 0.01), **channel})
+        if index == 0:
+            for gripper_qpos in np.linspace(SU.GRIPPER_OPEN_QPOS, SU.GRIPPER_CLOSED_QPOS, 7):
+                raw_env.sim.data.qpos[gripper_index] = gripper_qpos
+                raw_env.sim.forward()
+                swept = SU.jaw_channel(raw_env, z_low, z_high)
+                sweep.append({"gripper_qpos": float(gripper_qpos),
+                              "moving_inner_face_x": swept["moving_inner_face_x"],
+                              "channel_width": swept["channel_width"]})
 
     first = rows[0]
-    gap_to_fixed = abs(tcp[0] - first["fixed_inner_face_x"])
-    # Site-x position that centres an object of this radius just clear of the fixed jaw.
-    direction = 1.0 if first["fixed_on_negative_x"] else -1.0
-    object_center_x = first["fixed_inner_face_x"] + direction * object_radius
+    sign = 1.0 if first["fixed_on_negative_x"] else -1.0
+    # Object centre (site x) that leaves 1 cm between the object and the fixed jaw.
+    object_center_x = first["fixed_inner_face_x"] + sign * (object_width / 2 + 0.01)
     return {
-        "object_center_x_touching_fixed_jaw": float(object_center_x),
-        "object_fits_open_aperture": bool(2 * object_radius < first["open_aperture"]),
+        "gripper_qpos_after_reset": to_list(observed_qpos),
         "tcp_offset_local": to_list(tcp),
+        "object_width": object_width,
+        "object_site_z_interval": [float(z_low), float(z_high)],
         "all_inside": all(row["tcp_inside_open_jaws"] for row in rows),
+        "all_fit": all(row["fits"] for row in rows),
         "max_jaw_vertex_motion_in_site_frame": float(max_motion),
-        "tcp_to_fixed_inner_face": float(gap_to_fixed),
-        "object_radius": object_radius,
-        "object_shift_on_close": float(max(0.0, gap_to_fixed - object_radius)),
+        "fixed_jaw_clearance_if_centred_on_tcp": float(sign * (tcp[0] - first["fixed_inner_face_x"]) - object_width / 2),
+        "object_center_x_for_1cm_fixed_jaw_clearance": float(object_center_x),
+        "gripper_sweep": sweep,
         "rows": rows,
     }
 
@@ -189,8 +201,9 @@ def sample_clearance(raw_env, step, log):
     log["clearance"].append(entry)
 
 
-def run_phase(env, seed, reference, arm_qpos, mode, args):
-    raw_env = place_robot(env, seed, reference, arm_qpos)
+def run_phase(episode, reference, arm_qpos, mode, args):
+    env = episode.env
+    raw_env = place_robot(episode, reference, arm_qpos)
     qpos_index, _ = SU.arm_indices(raw_env)
     controller = raw_env.robots[0].composite_controller.part_controllers["right"]
 
@@ -200,6 +213,8 @@ def run_phase(env, seed, reference, arm_qpos, mode, args):
     start_site, start_rotation = SU.grip_site_pose(raw_env)
     start_joints = raw_env.sim.data.qpos[qpos_index].copy()
     start_base, start_yaw = SU.base_pose(raw_env)
+    gripper_index = SU.gripper_qpos_index(raw_env)
+    log["gripper_qpos_start"] = to_list(raw_env.sim.data.qpos[gripper_index])
     tcp_trace, joint_trace, base_trace, yaw_trace, command_trace = [], [], [], [], []
 
     try:
@@ -265,6 +280,7 @@ def run_phase(env, seed, reference, arm_qpos, mode, args):
     for group in ("base", "arm", "gripper"):
         values = [entry[group] for entry in log["clearance"]]
         log[f"min_{group}_clearance"] = float(min(values)) if values else None
+    log["gripper_qpos_final"] = to_list(raw_env.sim.data.qpos[gripper_index])
     log["start_tcp"] = to_list(start_tcp)
     log["start_joints"] = to_list(start_joints)
     return log, raw_env
@@ -300,6 +316,8 @@ def print_phase(height, log):
     print(f"    nearest at last sample: arm {nearest.get('arm_nearest')} | gripper {nearest.get('gripper_nearest')}")
     if "command_abs_max" in log:
         print(f"    |command| max {np.round(log['command_abs_max'], 3).tolist()} | saturated steps {log['command_saturated_steps']}")
+    print(f"    gripper qpos start {np.round(log['gripper_qpos_start'], 4).tolist()} -> final "
+          f"{np.round(log['gripper_qpos_final'], 4).tolist()}")
     print(f"    contacts: {log['contacts'] or 'none'}")
 
 
@@ -309,6 +327,8 @@ def print_phase(height, log):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--object-xml", default=None,
+                        help="Pin the target object (mjcf path) into the seed's layout via ControlledEpisode.")
     parser.add_argument("--hover-heights", type=float, nargs="+", default=[0.10, 0.12])
     parser.add_argument("--ready-backoff", type=float, default=0.10,
                         help="Ready TCP is this far from hover, towards the base (m).")
@@ -320,22 +340,23 @@ def main():
     parser.add_argument("--rotation-gain", type=float, default=0.3)
     parser.add_argument("--position-cap", type=float, default=0.2, help="Max |command| (x0.05 m).")
     parser.add_argument("--rotation-cap", type=float, default=0.1, help="Max |command| (x0.5 rad).")
-    parser.add_argument("--object-radius", type=float, default=None,
-                        help="Object radius (m); defaults to the object's horizontal_radius.")
+    parser.add_argument("--object-width", type=float, default=None,
+                        help="Object width (m); defaults to the measured collision width at the jaw band.")
     parser.add_argument("--output-dir", default=os.path.join(os.path.dirname(__file__), "probes", "ready_settle_seed0"))
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    env = make_env(args.seed)
-    reference = scene_reference(env, args.seed, args.base_backoff, args.base_lateral)
-    print("Gravity (model.opt.gravity):", env.unwrapped.env.sim.model._model.opt.gravity)
+    episode = ControlledEpisode(args.seed, args.object_xml)
+    reference = scene_reference(episode, args.base_backoff, args.base_lateral)
+    print("Placement:", json.dumps(reference["placement"], default=float))
+    print("Gravity (model.opt.gravity):", episode.raw_env.sim.model._model.opt.gravity)
     print("Instruction:", reference["instruction"])
     print("Object:", np.round(reference["object_position"], 4))
     print("Pregrasp base:", np.round(reference["base_xy"], 4), "yaw", round(reference["base_yaw"], 4))
 
     # Kinematic candidates for each hover height (IK on the teleported base).
-    env.reset(seed=args.seed)
-    raw_env = env.unwrapped.env
+    reset_episode(episode)
+    raw_env = episode.raw_env
     SU.teleport_base(raw_env, reference["base_xy"], reference["base_yaw"])
     base_position, base_yaw = SU.base_pose(raw_env)
     stow = np.array(raw_env.robots[0].init_qpos)
@@ -366,28 +387,36 @@ def main():
         configurations[f"hover_{height:.2f}"] = candidate["hover_qpos"]
     for index in range(5):
         configurations[f"random_{index}"] = rng.uniform(limits[:, 0] + 0.2, limits[:, 1] - 0.2)
-    if args.object_radius is None:
-        args.object_radius = float(raw_env.objects["obj"].horizontal_radius)
-    tcp_report = validate_tcp(env, args.seed, reference, configurations, args.object_radius)
+    model, data = raw_env.sim.model._model, raw_env.sim.data._data
+    from controlled_episode import object_collision_bottom
+    from measure_object_width import collision_points, width_report
+    object_geoms = [g for g in range(model.ngeom)
+                    if model.body_rootid[model.geom_bodyid[g]] == raw_env.obj_body_id["obj"]
+                    and (model.geom_contype[g] or model.geom_conaffinity[g])]
+    object_points = collision_points(model, data, object_geoms)
+    object_report = width_report(object_points, reference["object_position"][2])
+    object_width = args.object_width or object_report["band_width_max"]
+    tcp_report = validate_tcp(episode, reference, configurations, object_width,
+                              object_report["grasp_tcp_above_bottom"], object_report["height"])
     first = tcp_report["rows"][0]
-    print("\n=== TCP validation ===")
-    print(f"  TCP offset (site frame): {tcp_report['tcp_offset_local']}")
+    print("\n=== TCP / jaw validation ===")
+    print(f"  gripper qpos after reset (episode, before any command): {tcp_report['gripper_qpos_after_reset']}")
+    print(f"  object collision width {object_width:.4f} m | height {object_report['height']:.4f} m | "
+          f"grasp TCP {object_report['grasp_tcp_above_bottom']:.4f} m above object bottom")
+    print(f"  object occupies site z {np.round(tcp_report['object_site_z_interval'], 4).tolist()} during the grasp")
     print(f"  fixed jaw geoms: {first['fixed']}")
     print(f"  moving jaw geoms: {first['moving']}")
-    print(f"  closing axis site x: fixed inner face {first['fixed_inner_face_x']:+.4f} | moving inner face "
-          f"open {first['moving_inner_face_x_open']:+.4f}, closed {first['moving_inner_face_x_closed']:+.4f} "
-          f"| open aperture {first['open_aperture']:.4f} m")
+    print(f"  open gripper (qpos {SU.GRIPPER_OPEN_QPOS}): fixed inner face x {first['fixed_inner_face_x']}, "
+          f"moving inner face x {first['moving_inner_face_x']}, channel {first['channel_width']}")
     print(f"  jaw extent site y {np.round(first['jaw_y_range'], 4).tolist()} | z {np.round(first['jaw_z_range'], 4).tolist()}")
-    print(f"  TCP strictly between open jaw inner faces for all {len(tcp_report['rows'])} configurations: {tcp_report['all_inside']}")
+    print(f"  TCP inside open jaws for all {len(tcp_report['rows'])} configurations: {tcp_report['all_inside']} | "
+          f"object fits (+1 cm) for all: {tcp_report['all_fit']}")
     print(f"  max jaw-vertex motion in site frame across configurations: {tcp_report['max_jaw_vertex_motion_in_site_frame']:.2e} m")
-    print(f"  (mesh vertices within site z band {np.round(first['z_band'], 3).tolist()})")
-    print(f"  TCP to fixed-jaw inner face {tcp_report['tcp_to_fixed_inner_face']:.4f} m | object radius "
-          f"{args.object_radius:.4f} m | object fits open aperture: {tcp_report['object_fits_open_aperture']}")
-    print(f"  an object touching the fixed jaw would be centred at site x "
-          f"{tcp_report['object_center_x_touching_fixed_jaw']:+.4f} (TCP is at x {SU.TCP_OFFSET_LOCAL[0]:+.4f})")
-    for row in tcp_report["rows"]:
-        if not row["tcp_inside_open_jaws"]:
-            print(f"    OUTSIDE at {row['configuration']}: {row.get('error', '')}")
+    print(f"  fixed-jaw clearance if the object is centred on the TCP: {tcp_report['fixed_jaw_clearance_if_centred_on_tcp']*100:.2f} cm")
+    print(f"  object centre (site x) for 1 cm fixed-jaw clearance: {tcp_report['object_center_x_for_1cm_fixed_jaw_clearance']:+.4f}")
+    print("  gripper sweep (qpos -> moving inner face x, channel):")
+    for row in tcp_report["gripper_sweep"]:
+        print(f"    {row['gripper_qpos']:+.3f} -> {row['moving_inner_face_x']}, {row['channel_width']}")
 
     # Steps 1-8: dynamic validation for each height.
     results = {"reference": {k: to_list(v) if isinstance(v, np.ndarray) else v for k, v in reference.items()},
@@ -411,9 +440,9 @@ def main():
             results["heights"][f"{height:.2f}"] = entry
             continue
 
-        zero_log, _ = run_phase(env, args.seed, reference, candidate["ready_qpos"], "zero", args)
+        zero_log, _ = run_phase(episode, reference, candidate["ready_qpos"], "zero", args)
         print_phase(height, zero_log)
-        hold_log, raw_env = run_phase(env, args.seed, reference, candidate["ready_qpos"], "hold", args)
+        hold_log, raw_env = run_phase(episode, reference, candidate["ready_qpos"], "hold", args)
         print_phase(height, hold_log)
         hold_log["passes"] = hold_passes(hold_log)
         print(f"    HOLD PASSES: {hold_log['passes']}")
@@ -443,7 +472,7 @@ def main():
     with open(path, "w") as file:
         json.dump(results, file, indent=2, default=float)
     print("Saved", path)
-    env.close()
+    episode.close()
 
 
 if __name__ == "__main__":

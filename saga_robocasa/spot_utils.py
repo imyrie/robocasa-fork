@@ -247,6 +247,17 @@ TCP_DISTANCE = 0.208
 TCP_OFFSET_LOCAL = TCP_DISTANCE * APPROACH_LOCAL
 FINGER_MESH_KEYS = ("jaw", "finger", "tooth")
 
+# Gripper command convention (verify empirically with verify_gripper_convention-style tests):
+#   wrapper action.gripper_close < 0.5  -> robosuite gripper action -1
+#   wrapper action.gripper_close >= 0.5 -> robosuite gripper action +1
+#   BDGripper.format_action ramps its internal command by 0.2 per policy step towards that sign;
+#   SimpleGripController maps command a to position ctrl = -0.785 + 0.785 * a on joint arm_f1x
+#   (range [-1.57, 0]), so -1 drives the finger to -1.57 rad and +1 drives it to 0 rad.
+OPEN_GRIPPER = np.array([0.0], dtype=np.float32)   # wrapper value expected to open (qpos -> -1.57)
+CLOSE_GRIPPER = np.array([1.0], dtype=np.float32)  # wrapper value expected to close (qpos -> 0)
+GRIPPER_OPEN_QPOS = -1.57
+GRIPPER_CLOSED_QPOS = 0.0
+
 
 def grip_site_pose(raw_env):
     data = raw_env.sim.data._data
@@ -296,48 +307,70 @@ def finger_geom_vertices(raw_env):
     return vertices
 
 
-def jaw_analysis(open_vertices, closed_vertices, z_center, z_half_band=0.02, moving_threshold=1e-3):
+def moving_jaw_bodies(raw_env):
+    """Bodies moved by the gripper finger joint (the joint's body and its descendants)."""
+    model = raw_env.sim.model._model
+    finger_joint = int(raw_env.sim.model.joint_name2id(raw_env.robots[0].gripper["right"].joints[0]))
+    root = model.jnt_bodyid[finger_joint]
+    moving = set()
+    for body in range(model.nbody):
+        current = body
+        while current > 0:
+            if current == root:
+                moving.add(body)
+                break
+            current = model.body_parentid[current]
+    return moving
+
+
+def jaw_channel(raw_env, z_low, z_high):
     """
-    Exact jaw geometry along the closing axis (site x) within a z band around the TCP.
+    Free channel along the closing axis (site x) between the fixed and moving jaws, over the
+    site-frame height interval [z_low, z_high], at the current gripper state.
 
-    Geoms whose vertices move between the open and closed gripper states are the moving
-    jaw; the rest are the fixed jaw. Inner faces are the vertex extremes facing each other.
+    Returns fixed/moving inner faces (None for a jaw with no vertices in the interval) and
+    the channel width (inf when the moving jaw has swung out of the interval).
     """
-    moving = [m for m in open_vertices if np.abs(open_vertices[m] - closed_vertices[m]).max() > moving_threshold]
-    fixed = [m for m in open_vertices if m not in moving]
+    model = raw_env.sim.model._model
+    moving_bodies = moving_jaw_bodies(raw_env)
+    vertices = finger_geom_vertices(raw_env)
+    mesh_body = {}
+    for geom_id in collidable(model):
+        if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh_body[mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, model.geom_dataid[geom_id])] = model.geom_bodyid[geom_id]
 
-    def band(vertex_sets, names):
-        points = np.vstack([vertex_sets[n] for n in names])
-        return points[np.abs(points[:, 2] - z_center) <= z_half_band]
+    def in_band(names):
+        if not names:
+            return np.zeros((0, 3))
+        points = np.vstack([vertices[n] for n in names])
+        return points[(points[:, 2] >= z_low) & (points[:, 2] <= z_high)]
 
-    fixed_points = band(open_vertices, fixed)
-    moving_open = band(open_vertices, moving)
-    moving_closed = band(closed_vertices, moving)
-    all_open = np.vstack([fixed_points, moving_open])
-    result = {"fixed": fixed, "moving": moving, "z_band": [z_center - z_half_band, z_center + z_half_band]}
-    if len(fixed_points) == 0 or len(moving_open) == 0:
-        result["error"] = "no jaw vertices in the TCP z band"
-        return result
-    fixed_on_negative_x = fixed_points[:, 0].mean() < moving_open[:, 0].mean()
-    if fixed_on_negative_x:
-        fixed_inner = fixed_points[:, 0].max()
-        moving_inner_open = moving_open[:, 0].min()
-        moving_inner_closed = moving_closed[:, 0].min() if len(moving_closed) else float("nan")
+    moving = [m for m in vertices if mesh_body[m] in moving_bodies]
+    fixed = [m for m in vertices if m not in moving]
+    fixed_points, moving_points = in_band(fixed), in_band(moving)
+    all_fixed = np.vstack([vertices[n] for n in fixed])
+    all_moving = np.vstack([vertices[n] for n in moving])
+    # Closing direction: the moving jaw sits on the +x or -x side of the fixed jaw.
+    fixed_on_negative_x = all_fixed[:, 0].mean() < all_moving[:, 0].mean()
+    sign = 1.0 if fixed_on_negative_x else -1.0
+
+    fixed_inner = None if len(fixed_points) == 0 else float((fixed_points[:, 0] * sign).max() * sign)
+    moving_inner = None if len(moving_points) == 0 else float((moving_points[:, 0] * sign).min() * sign)
+    if fixed_inner is None:
+        width = float("nan")
+    elif moving_inner is None:
+        width = float("inf")
     else:
-        fixed_inner = fixed_points[:, 0].min()
-        moving_inner_open = moving_open[:, 0].max()
-        moving_inner_closed = moving_closed[:, 0].max() if len(moving_closed) else float("nan")
-    result.update(
-        fixed_on_negative_x=bool(fixed_on_negative_x),
-        fixed_inner_face_x=float(fixed_inner),
-        moving_inner_face_x_open=float(moving_inner_open),
-        moving_inner_face_x_closed=float(moving_inner_closed),
-        open_aperture=float(abs(moving_inner_open - fixed_inner)),
-        jaw_y_range=[float(all_open[:, 1].min()), float(all_open[:, 1].max())],
-        jaw_z_range=[float(np.vstack(list(open_vertices.values()))[:, 2].min()),
-                     float(np.vstack(list(open_vertices.values()))[:, 2].max())],
-    )
-    return result
+        width = float(abs(moving_inner - fixed_inner))
+    all_points = np.vstack(list(vertices.values()))
+    return {
+        "fixed": fixed, "moving": moving, "fixed_on_negative_x": bool(fixed_on_negative_x),
+        "z_interval": [float(z_low), float(z_high)],
+        "fixed_inner_face_x": fixed_inner, "moving_inner_face_x": moving_inner,
+        "channel_width": width,
+        "jaw_y_range": [float(all_points[:, 1].min()), float(all_points[:, 1].max())],
+        "jaw_z_range": [float(all_points[:, 2].min()), float(all_points[:, 2].max())],
+    }
 
 
 def gripper_qpos_index(raw_env):

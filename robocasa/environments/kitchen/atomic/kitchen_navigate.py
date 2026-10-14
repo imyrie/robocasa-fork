@@ -123,7 +123,7 @@ class NavigateKitchen(Kitchen):
 
     def _check_success(self):
         """
-        Check whether the robot is close to and facing the target fixture. and the robot is facing the fixture.
+        Check whether the robot is close to and facing the target fixture.
 
         Returns:
             bool: True if the task is successful, False otherwise.

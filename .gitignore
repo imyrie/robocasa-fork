@@ -174,3 +174,5 @@ robocasa/scripts/taskgen/task_prompting/outputs/
 saga_robocasa/trajectories/*.npz
 saga_robocasa/trajectories/*.json
 !saga_robocasa/trajectories/.gitkeep
+
+saga_robocasa/probes/

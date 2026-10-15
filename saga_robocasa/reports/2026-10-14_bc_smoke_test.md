@@ -332,3 +332,57 @@ Remaining confound not yet isolated: the best original Stage B was trained **wit
 fixed-base demonstrations, whereas every B2 variant includes them (as well as the phase boosts and
 6,000 instead of 4,000 steps). The next controlled test is the original Stage B recipe (no fixed-base
 demos, no phase boosts, 4,000 steps) with only the transport-recovery episodes added.
+
+---
+
+# Clean transport-recovery ablation on the original Stage B recipe (2026-10-15)
+
+**Single-difference design.** `bc_B_htr_ablation.pt` = the original best Stage B recipe
+(`bc_B_manip_without_fixed.pt`: no fixed-base demos, no phase boosts, 4,000 steps, original 10-D
+proprioception, BC loss only, original balanced sampler, seed 0, held-out `nav_far_004`) plus the 12
+successful hybrid transport recoveries. Verification: retraining the original recipe with the current
+code (`bc_B_repro_check.pt`) reproduces the original checkpoint exactly (identical loss history,
+max |weight difference| 0.0, identical normalization statistics), so the only difference between the
+two compared checkpoints is the added episodes.
+
+| | original Stage B | + transport recoveries |
+|---|---|---|
+| training episodes | 12 (`nav_000`, `nav_far_001`–`003`, 8 navigation DAgger recoveries) | 24 (+ `htr_far_1_*`, `htr_far_6_*`, `htr_far_8_*`, `htr_near_6_*`) |
+| sampling: navigation / recovery / transport recovery | 50 / 50 / — % | 33.1 / 33.0 / 33.9 % (the original sampler gives each source an equal share) |
+| sampling: grasp phases / transport-release-retract phases | — | 21.3% / 38.9% |
+
+Closed loop, perturb seeds 5–10, base held at zero, original aborts, no safety projection (as in the
+original Stage B evaluation):
+
+| model | hover | grasp | lift | placed | retract | `_check_success()` | failures |
+|---|---|---|---|---|---|---|---|
+| original Stage B | 6/6 | 5/6 | 4/6 | 2/6 | 2/6 | **2/6** (6, 8) | cabinet collision (5), wrist limit (7), object drops (9, 10) |
+| + transport recoveries | 6/6 | **5/6** | 2/6 | 0/6 | 0/6 | **0/6** | wrist limit (5, 7), gripper–sink collisions (6, 8), cabinet-door collision (9), object drop (10) |
+
+Per-step `_check_success()` after release: the recovery-augmented model released the can in only one
+rollout (seed 9) and `_check_success()` stayed False for all 14 logged steps after it.
+
+**Decision.** Grasping is preserved (5/6) but transport and success get worse (2/6 → 0/6), so the
+original Stage B remains the best manipulation policy. No further sampler variants are trained.
+
+## Final hybrid result with the best checkpoints
+
+Learned navigation (`bc_A_nav.pt`) and learned manipulation (`bc_B_manip_without_fixed.pt`) with a
+rule-based mode transition (≤ 1 cm and ≤ 0.01 rad held for 10 steps), the navigation arm-hold rule,
+zero base during manipulation, the original aborts and no joint-safety projection. The run
+(`data/evaluations/hybrid_final_*`) is bit-identical to the earlier `hybrid_hold_*` series (all
+simulator states equal), confirming the deployment is deterministic.
+
+| start | seen by A / B | gate (step) | grasp (step) | placed | `_check_success()` | failure (step) |
+|---|---|---|---|---|---|---|
+| far 1 | yes / yes | yes (184) | yes (323) | no | False | wrist `wr0` limit, margin 0.038 (394) |
+| far 6 | A val / no | yes (167) | yes (307) | no | False | `wr0` limit, margin 0.042 (388) |
+| far 7 | no / no | yes (159) | no | no | False | gripper–sink collision (1174) |
+| far 8 | no / no | yes (166) | yes (297) | no | False | `wr0` limit, margin 0.039 (376) |
+| near 5 | no / no | yes (51) | no | no | False | gripper–sink collision (1067) |
+| near 6 | no / no | yes (29) | yes (167) | no | False | `wr0` limit, margin 0.044 (237) |
+
+**Hybrid success rate 0/6** (navigation gate 6/6, grasp 4/6, placement 0/6). The same manipulation
+checkpoint succeeds on 2/6 fixed-base starts, so the remaining gap is specific to the states the
+learned navigation hands over (base within the 1 cm / 0.01 rad gate, arm held in its post-reset pose),
+from which transport repeatedly drives `wr0` towards its limit.

@@ -134,3 +134,65 @@ timeouts.
 - Closed loop: navigation-only reaches the gate on 4/6 starts; manipulation-only succeeds on 1/4 and
   2/4 with the base held fixed; the full combined task does not succeed (0/12).
 - Not established: anything about generalization beyond this single controlled layout.
+
+---
+
+# Hybrid autonomous deployment (Week 1 expectation 3)
+
+**This is a HYBRID system**: learned navigation (Stage A checkpoint `bc_A_nav.pt`) → **rule-based**
+transition (pregrasp error ≤ 0.01 m and ≤ 0.01 rad for 10 consecutive steps; permanent switch) →
+learned manipulation (Stage B checkpoint `bc_B_manip_without_fixed.pt`, the better of the two
+B models). No expert actions after reset; the expert code only defines the pregrasp goal and the
+safety thresholds. Rules: during navigation the gripper is forced open; during manipulation the
+base velocity is forced to exactly zero before `BaseActionModel`. Collision, joint-limit (0.05 rad
+margin) and object-drop aborts are unchanged. Script: `policy/deploy_hybrid.py`. Every rollout has
+an external-camera video and full metrics in `data/evaluations/hybrid_*`.
+
+Seen in training: start far 1 is a training episode of both checkpoints (`nav_far_001`); far 6 is
+A's held-out validation episode and unseen by B; far 7, far 8, near 5, near 6 were never seen by
+either checkpoint.
+
+## Variant 1 — arm rule "zero OSC delta" (as first implemented)
+
+| start | gate | grasp | placement | `_check_success` | outcome |
+|---|---|---|---|---|---|
+| far 1 (known) | no | no | no | False | gate not reached in 600 steps |
+| far 6 (A val) | no | no | no | False | gate not reached in 600 steps |
+| far 7 (unseen) | no | no | no | False | gate not reached in 600 steps |
+| far 8 (unseen) | no | no | no | False | gate not reached in 600 steps |
+| near 5 (unseen) | yes (52) | no | no | False | gripper–sink collision at step 601 |
+| near 6 (unseen) | yes (28) | no | no | False | gripper–sink collision at step 553 |
+
+Diagnosis: a zero delta does **not** suppress arm motion. With the OSC in `achieved` goal-update
+mode there is no restoring force, so while the base accelerates and turns the arm drifts by up to
+0.95 rad (TCP 41 cm relative to the base; under the Stage A policy's own arm actions the drift was
+≤ 0.09 rad). The navigation policy's observations leave the training distribution after ~82 steps
+and it stalls ~4.8 cm from the goal.
+
+## Variant 2 — arm rule "hold the post-reset gripper pose relative to the base" (fixed stabilizer, no task information)
+
+| start | gate (step) | grasp (step) | placement | `_check_success` | failure (step) |
+|---|---|---|---|---|---|
+| far 1 (known to A and B) | **yes** (184) | **yes** (323) | no | False | wrist `wr0` joint limit, margin 0.038 (394) |
+| far 6 (A val, unseen by B) | **yes** (167) | **yes** (307) | no | False | `wr0` joint limit, margin 0.042 (388) |
+| far 7 (unseen) | **yes** (159) | no | no | False | gripper–sink collision (1174); can pushed 31 cm |
+| far 8 (unseen) | **yes** (166) | **yes** (297) | no | False | `wr0` joint limit, margin 0.039 (376) |
+| near 5 (unseen) | **yes** (51) | no | no | False | gripper–sink collision (1067); can pushed 31 cm |
+| near 6 (unseen) | **yes** (29) | **yes** (167) | no | False | `wr0` joint limit, margin 0.044 (237) |
+
+**Navigation gate 6/6, grasp 4/6, placement 0/6, full `_check_success()` 0/6.**
+
+Diagnosis: every grasping rollout lifts the can ~10.5 cm and then, during transport towards the
+sink, drives the wrist pitch `wr0` to ≈ +1.79 rad (limit 1.833; abort at 0.05 rad margin). Across
+the 15 expert navigation demos `wr0` never exceeds 1.608 rad. The remaining two rollouts never
+close on the can, push it along the counter and hit the sink.
+
+## Week 1 status
+
+1. Whole-task data with navigation + manipulation: done (15 navigation demos, 8 recovery demos,
+   6 fixed-base demos; all validated with bit-exact replay).
+2. Imitation-learning policy: PointNet + MLP behaviour cloning built and evaluated in stages; the
+   diffusion policy has not been started.
+3. Autonomous completion: the hybrid system navigates autonomously to the pregrasp gate on 6/6
+   starts and grasps on 4/6, but has **not yet completed the task (0/6)**; the blocking failure is
+   the wrist joint limit during learned transport.

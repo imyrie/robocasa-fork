@@ -155,7 +155,7 @@ def main():
     status, reason, grasped, first_close_step, no_contact_steps = "timeout", f"max steps {args.max_steps}", False, None, 0
     gate_streak, gate_step = 0, None
     projection_count, projection_unresolved = 0, 0
-    log.update(arm_raw=[], arm_projected=[], projection_active=[])
+    log.update(arm_raw=[], arm_projected=[], projection_active=[], joint_margin=[], inside_sink=[], check_success=[])
     previous_normalized = None
     clip_events, rate_events = 0, 0
     wrapper_obs = episode.env.unwrapped.get_observation(raw_env._get_observations(force_update=True))
@@ -224,6 +224,9 @@ def main():
         log["yaw_error"].append(float(abs(np.angle(np.exp(1j * (base_yaw - goal_yaw))))))
         log["object_position"].append(can["position"])
         log["jaws"].append(both_jaws)
+        log["joint_margin"].append(fsm.joint_margin())
+        log["inside_sink"].append(bool(OU.obj_inside_of(raw_env, "obj", raw_env.sink, partial_check=True)))
+        log["check_success"].append(bool(raw_env._check_success()))
 
         if both_jaws and can["position"][2] > object_start_z + 0.05:
             grasped = True

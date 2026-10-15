@@ -273,3 +273,62 @@ B2 no longer approaches the wrist limit, but it now fails earlier, mostly in gra
 (insecure or missed closes followed by lifting into the upper cabinets). Likely cause (not yet
 isolated): the transport-recovery episodes start mid-carry and, with the source and phase boosts,
 take 52% of the sampling mass while approach/descend/close get ~2% each.
+
+---
+
+# Stage B2 sampling ablation and factor isolation (2026-10-15)
+
+All models evaluated on the same six fixed-base pregrasp starts (perturb seeds 5–10; seed 5 = held-out
+`demo_005`, 6–10 never recorded), base held at zero; B2 variants with the 0.08 rad joint-safety
+projection. Metrics from `policy/rollout_metrics.py` (hover: TCP ≤ 3 cm horizontally and 4–25 cm above
+the object before the first close; grasp: both jaws on the object ≥ 10 consecutive steps; lift: object
+≥ 5 cm above start with both jaws; placement: object inside the sink at any step; retract: grip site
+≥ 0.25 m from the object after reopening, the `gripper_obj_far` criterion). Original Stage B was
+run on seeds 9 and 10 for this comparison with its original settings (no projection).
+
+## Sampling (before training)
+
+| | B2 (oversampled) | B2 without source boost |
+|---|---|---|
+| fixed_base / navigation / recovery / hybrid_transport_recovery | 15.8 / 16.0 / 15.9 / **52.3%** | 24.3 / 24.5 / 24.5 / **26.7%** |
+| APPROACH_HOVER + DESCEND + CLOSE + GRASP_HOLD | 12.7% | 16.2% (3.2 / 3.0 / 3.8 / 6.1) |
+| RETRACT + TRANSIT + RELEASE_DESCEND + OPEN + RETRACT_UP + RETRACT_BACK | 57.7% | 55.8% |
+
+Raw sample counts (both): 36 training episodes; by source fixed_base 3,525, navigation 9,892,
+recovery 5,676, hybrid_transport_recovery 4,604; grasp-group phases 3,661, transport/release/retract
+phases 14,844.
+
+## Results (successes / 6)
+
+| model | hover | grasp | lift | placed | retract | `_check_success()` | projection activations |
+|---|---|---|---|---|---|---|---|
+| original Stage B (`bc_B_manip_without_fixed`) | 6 | **5** | 4 | 2 | 2 | **2** (6, 8) | n/a |
+| B2 oversampled (`bc_B2_manip`) | 5 | 4 | 3 | 1 | — | 0 | 0 |
+| B2 no source boost (`bc_B2_no_source_boost`) | 4 | 3 | 2 | 1 | — | 0 | 6 (seed 8, all unresolved) |
+| ↳ basic proprioception (`bc_B2nsb_basic_proprio`) | 6 | 4 | 3 | 2* | 0 | 0 | 24 (seed 5) |
+| ↳ no joint penalty (`bc_B2nsb_no_joint_penalty`) | 6 | 3 | 2 | 1 | 1 | **1** (seed 6) | 0 |
+
+\*Both placements by the basic-proprioception model held the can in the sink until the 1,000-step
+timeout without reopening.
+
+Per-step `_check_success()` after release (logged for the new runs): the one success (no joint
+penalty, seed 6) became True 1 step after the reopen was followed by retraction; in the other
+released runs it stayed False for every logged step (53–335 steps).
+
+**Projection limitation observed.** In "B2 no source boost", seed 8, the policy predicted vertical
+arm translations far outside the training range (`eef_dz` 1.2 → 4.9 in policy units). The projection
+zeroed the rotation on all 6 activations as specified, but translation is deliberately never
+modified, so the wrist still crossed its limit (margin −0.019 rad); all 6 activations are counted
+as unresolved.
+
+## Decision
+
+Grasp did not return to the original Stage B level (5/6) with the source boost removed (3/6), so
+sampler tuning was stopped and the two new factors were isolated. Neither single-factor change
+recovers grasping (4/6 and 3/6), and with six starts per model the differences between B2 variants
+are within one or two rollouts. The hybrid evaluation was therefore **not** rerun.
+
+Remaining confound not yet isolated: the best original Stage B was trained **without** the six
+fixed-base demonstrations, whereas every B2 variant includes them (as well as the phase boosts and
+6,000 instead of 4,000 steps). The next controlled test is the original Stage B recipe (no fixed-base
+demos, no phase boosts, 4,000 steps) with only the transport-recovery episodes added.

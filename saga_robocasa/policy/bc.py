@@ -115,9 +115,16 @@ def main():
         weight_array = balanced_weights(dataset, phase_boost=parse_boosts(args.phase_boost),
                                         source_boost=parse_boosts(args.source_boost))
         report = sampling_report(dataset, weight_array)
-        print("Training samples / sampling mass by source and phase:")
+        print("Training samples / effective sampling probability by source and phase:")
         for (kind, name), (count, mass) in sorted(report.items()):
-            print(f"  {kind:<6} {name:<28} samples {count:6d}  mass {mass * 100:5.1f}%")
+            print(f"  {kind:<6} {name:<28} samples {count:6d}  probability {mass * 100:5.1f}%")
+        groups = {"grasp (APPROACH_HOVER, DESCEND, CLOSE, GRASP_HOLD)": ("APPROACH_HOVER", "DESCEND", "CLOSE", "GRASP_HOLD"),
+                  "transport/release/retract (RETRACT, TRANSIT, RELEASE_DESCEND, OPEN, RETRACT_UP, RETRACT_BACK)":
+                      ("RETRACT", "TRANSIT", "RELEASE_DESCEND", "OPEN", "RETRACT_UP", "RETRACT_BACK")}
+        for label, members in groups.items():
+            count = sum(report.get(("phase", m), (0, 0.0))[0] for m in members)
+            mass = sum(report.get(("phase", m), (0, 0.0))[1] for m in members)
+            print(f"  GROUP {label}: samples {count}, probability {mass * 100:.1f}%")
         weights = torch.as_tensor(weight_array, dtype=torch.double)
         sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True,
                                                          generator=torch.Generator().manual_seed(args.seed))

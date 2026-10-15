@@ -26,7 +26,7 @@ from scipy.spatial.transform import Rotation
 
 import spot_utils as SU
 from controlled_episode import ControlledEpisode
-from expert_fsm import ExpertConfig, prepare_start
+from expert_fsm import ExpertConfig, prepare_restored_manipulation_start, prepare_start
 from nav_expert import NavConfig, prepare_navigation_start, prepare_restored_start
 from record_expert_demo import WRAPPER_KEYS, state_hash
 
@@ -157,7 +157,9 @@ def replay(arrays, meta):
     config = ExpertConfig(**{k: (tuple(tuple(x) if isinstance(x, list) else x for x in v) if isinstance(v, list) else v)
                              for k, v in meta["expert_config"].items() if k in fields})
     episode = ControlledEpisode(config.seed, meta["object_xml"], policy_camera=True)
-    if meta.get("navigation") and meta["navigation"].get("restored_from"):
+    if meta.get("recovery"):
+        prepare_restored_manipulation_start(episode, config, meta["recovery"]["source_rollout"], meta["recovery"]["source_step"])
+    elif meta.get("navigation") and meta["navigation"].get("restored_from"):
         prepare_restored_start(episode, config, NavConfig(**meta["navigation"]["config"]),
                                meta["navigation"]["restored_from"], meta["navigation"]["restored_step"])
     elif meta.get("navigation"):

@@ -196,3 +196,80 @@ close on the can, push it along the counter and hit the sink.
 3. Autonomous completion: the hybrid system navigates autonomously to the pregrasp gate on 6/6
    starts and grasps on 4/6, but has **not yet completed the task (0/6)**; the blocking failure is
    the wrist joint limit during learned transport.
+
+---
+
+# Stage B2: transport-focused manipulation retraining (2026-10-15)
+
+## Policy-input inspection (before training)
+
+Stage B (`bc_B_manip_without_fixed.pt`) inputs: arm joint positions incl. `wr0` — **yes** (6);
+joint-limit margins — **no** (only implicit in qpos); TCP pose — **position only** (base frame), no
+orientation; object-to-TCP pose — **no** explicit offset (both positions present), no object
+orientation; sink goal — interior-centre **position** (base frame). B2 adds
+`proprio_mode="extended"` (+18): joint-limit margins (6), TCP orientation (first two rotation-matrix
+columns, base frame, 6), object−TCP offset (3), object up-axis (3). The original 10-D mode is
+unchanged and still the default.
+
+## Hybrid transport recovery data (`data/hybrid_transport_recovery`)
+
+States restored 20/40/60 steps before each abort of the six arm-hold hybrid rollouts; provenance
+(source rollout, step, initial `wr0`, object pose, failure type, grasped-at-restore) in each
+demo's `recovery` metadata. New expert capability: mid-carry start at GRASP_HOLD
+(`prepare_restored_manipulation_start`), lifting relative to the nominal grasp height.
+
+| source failure | restores | expert recovery | validated (exact replay + `_check_success`) |
+|---|---|---|---|
+| wrist limit: far 1, far 6, far 8, near 6 | 12 (`wr0` ≈ 1.63 at restore, can grasped) | **12/12 success** | 12/12 |
+| gripper–sink collision: far 7, near 5 | 6 (can pushed ~31 cm to the sink edge) | 0/6 (2 refused: gripper 2.5 mm from the sink; 4 no feasible transport plan) | — (kept in `data/failures`) |
+
+## Training (`bc_B2_manip.pt`)
+
+Manipulation phases of the fixed-base demos, the full-task demos and DAgger recoveries, plus the 12
+transport recoveries; held out by episode: `demo_005`, `nav_far_004`, `htr_far_8_*` (3).
+Balanced sampling with TRANSIT/RELEASE_DESCEND ×3, RETRACT/RETRACT_UP/RETRACT_BACK ×2 and
+transport-recovery source ×3; 6,000 steps. Not phase-conditioned (phase is not an input).
+
+| source | samples | sampling mass |
+|---|---|---|
+| fixed_base | 3,525 | 15.8% |
+| navigation (full-task demos) | 9,892 | 16.0% |
+| recovery (navigation DAgger) | 5,676 | 15.9% |
+| hybrid_transport_recovery | 4,604 | 52.3% |
+
+By phase: TRANSIT 11.2%, RELEASE_DESCEND 11.3%, RETRACT 10.2%, RETRACT_BACK 9.5%, RETRACT_UP 9.0%,
+APPROACH_HOVER 2.1%, DESCEND 2.0%, CLOSE 2.4%.
+
+Auxiliary joint-limit penalty (weight 0.5, band 0.10 rad inside the demonstrated joint range):
+predicted joint motion `M @ a` (arm Jacobian pseudo-inverse composed with the OSC delta scaling,
+precomputed at every recorded state, `policy/compute_joint_maps.py`) is penalized when it moves a
+joint further outward inside the band. Validated against recorded motion: per-joint correlation
+0.88–1.00 (`wr0` 0.99), sign agreement 0.93–0.94; actual one-step motion ≈ 25–30% of `M @ a` (the
+OSC covers part of the goal offset per step), so the map is conservative. Offline: train MSE
+0.0030, held-out 0.0195, held-out gripper accuracy 0.994.
+
+## Deployment safety layer
+
+`spot_utils.joint_safety_projection` (a safety layer around the learned policy, not an expert
+action): predicts next joint margins with the live map and, if any would fall below 0.08 rad
+while the action reduces it, scales only the arm rotation delta. Raw and projected actions are
+logged separately.
+
+## Stage B2 closed-loop evaluation (fixed base, joint-safety projection 0.08 rad)
+
+| start | seen | grasp | placed | `_check_success` | outcome (step) | projection active |
+|---|---|---|---|---|---|---|
+| perturb 5 | held-out demo | no | no | False | arm–upper-cabinet collision (175) after an insecure close and empty lift | 0 |
+| perturb 6 | unseen | yes | no | False | object dropped outside the sink (279) | 0 |
+| perturb 7 | unseen | yes | **yes** | False | gripper–sink collision while retracting (571) | 0 |
+| perturb 8 | unseen | no | no | False | cabinet-door collision (771) | 0 (2 unresolved) |
+| perturb 9 | unseen | no | no | False | gripper–counter collision (165), closed 7.8 cm beside the can | 0 |
+| perturb 10 | unseen | no | no | False | arm–upper-cabinet collision (176) after an empty lift | 0 |
+
+**0/6 — Stage B2 did not meet the prerequisite** (at least one held-out/unseen success), so the
+hybrid rerun was **not** performed. B2 is worse than the original Stage B on the overlapping starts
+(original B with base held at zero completed perturb 6 and 8). The projection never activated:
+B2 no longer approaches the wrist limit, but it now fails earlier, mostly in grasp alignment
+(insecure or missed closes followed by lifting into the upper cabinets). Likely cause (not yet
+isolated): the transport-recovery episodes start mid-carry and, with the source and phase boosts,
+take 52% of the sampling mass while approach/descend/close get ~2% each.

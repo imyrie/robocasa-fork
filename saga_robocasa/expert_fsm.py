@@ -393,9 +393,13 @@ class ExpertFSM:
         config, start = self.config, self.start
         ready_rotation = start["ready_rotation"]
 
-        yield from self._move("APPROACH_HOVER", start["hover_tcp"], ready_rotation, config.approach_speed, SU.OPEN_GRIPPER)
-        yield from self._move("DESCEND", start["grasp_tcp"], ready_rotation, config.slow_speed, SU.OPEN_GRIPPER)
+        carrying = start.get("start_phase") == "GRASP_HOLD"  # restored mid-carry (object already grasped)
+        if not carrying:
+            yield from self._move("APPROACH_HOVER", start["hover_tcp"], ready_rotation, config.approach_speed, SU.OPEN_GRIPPER)
+            yield from self._move("DESCEND", start["grasp_tcp"], ready_rotation, config.slow_speed, SU.OPEN_GRIPPER)
+        yield from self._grasp_and_carry(config, start, ready_rotation, carrying)
 
+    def _grasp_and_carry(self, config, start, ready_rotation, carrying):
         # CLOSE: until both jaws touch the object and the finger has stopped moving.
         history = []
 
@@ -407,8 +411,9 @@ class ExpertFSM:
             settled = len(history) >= 5 and max(history[-5:]) - min(history[-5:]) < 2e-3
             return settled and bool(contacts["fixed_jaw"]) and bool(contacts["moving_jaw"])
 
-        yield from self._hold_until("CLOSE", SU.CLOSE_GRIPPER, closed_on_object, 12, 80,
-                                    lambda: f"gripper qpos {history[-1] if history else None}")
+        if not carrying:
+            yield from self._hold_until("CLOSE", SU.CLOSE_GRIPPER, closed_on_object, 12, 80,
+                                        lambda: f"gripper qpos {history[-1] if history else None}")
 
         # GRASP_HOLD: until the object is stationary in the gripper.
         relative_history = []
@@ -428,7 +433,7 @@ class ExpertFSM:
             (self.can_state()["position"] - start["object_origin"])[:2]))}))
 
         # PLAN_TRANSPORT (no env steps).
-        plan = self._plan_transport()
+        plan = self._plan_transport(carrying)
 
         rotation = plan["post_close_rotation"]
         yield from self._move("LIFT_OFF", plan["lift_off_tcp"], rotation, config.slow_speed, SU.CLOSE_GRIPPER)
@@ -481,12 +486,17 @@ class ExpertFSM:
 
     # ---------------------------------------------------------------- planning
 
-    def _plan_transport(self):
+    def _plan_transport(self, carrying=False):
         config, start = self.config, self.start
         post_close_site, post_close_rotation = SU.grip_site_pose(self.raw_env)
         post_close_tcp = SU.tcp_position(self.raw_env)
         lift_off_tcp = post_close_tcp + np.array([0.0, 0.0, LIFT_OFF])
         lift_tcp = post_close_tcp + np.array([0.0, 0.0, config.lift])
+        if carrying:
+            # Restored mid-carry: lift to the nominal height above the grasp pose, not further.
+            target_z = max(post_close_tcp[2], start["grasp_tcp"][2] + config.lift)
+            lift_tcp = np.array([post_close_tcp[0], post_close_tcp[1], target_z])
+            lift_off_tcp = post_close_tcp + np.array([0.0, 0.0, min(LIFT_OFF, target_z - post_close_tcp[2])])
         retract_tcp = lift_tcp + SU.base_to_world([-config.retract, 0.0, 0.0], np.zeros(3), start["base_yaw"])
         tcp_above_bottom = post_close_tcp[2] - object_collision_bottom(self.raw_env, "obj")
         release_points, floor_z, _ = sink_release_point(self.raw_env, CAN_HALF_WIDTH)
@@ -553,3 +563,52 @@ class ExpertFSM:
                 return {"up_tcp": up_tcp, "back_tcp": back_tcp}
         self.plans["retract_attempts"] = attempts
         raise ExpertAbort("PLAN_RETRACT", "planning failure: no safe post-release retract")
+
+
+def prepare_restored_manipulation_start(episode, config, rollout_path, step):
+    """
+    Restore the exact simulator state a policy rollout visited at `step` (qpos/qvel recorded by
+    record_expert_demo.Recorder) for a manipulation-only expert recovery, with no navigation.
+    The pregrasp goal comes from prepare_start(); grasp targets are re-derived from the object's
+    current pose; the BD gripper's internal ramp is set from the rollout's last gripper command.
+    If both jaws hold the object, the expert starts mid-carry at GRASP_HOLD (start_phase); otherwise
+    it performs the whole manipulation from the restored state.
+    """
+    start = prepare_start(episode, config)
+    raw_env = episode.raw_env
+    with np.load(rollout_path) as archive:
+        qpos, qvel = archive["obs_sim_qpos"][step], archive["obs_sim_qvel"][step]
+        commands = archive["eval_gripper_command"]
+    raw_env.sim.data.qpos[:] = qpos
+    raw_env.sim.data.qvel[:] = qvel
+    raw_env.sim.forward()
+    SU.sync_controllers(raw_env)
+    last_close = step > 0 and commands[step - 1] > 0.5
+    raw_env.robots[0].gripper["right"].current_action = np.array([1.0 if last_close else -1.0])
+
+    object_origin = np.array(raw_env.sim.data.body_xpos[raw_env.obj_body_id["obj"]])
+    object_quat = np.array(raw_env.sim.data.body_xquat[raw_env.obj_body_id["obj"]])
+    object_bottom = object_collision_bottom(raw_env, "obj")
+    closing_axis = start["ready_rotation"][:, 0]
+    alignment = -config.object_center_site_x * np.array([closing_axis[0], closing_axis[1], 0.0])
+    grasp_z = max(object_origin[2], object_bottom + FINGERTIP_BELOW_TCP + FINGERTIP_CLEARANCE)
+    nominal_grasp_tcp = start["grasp_tcp"].copy()
+    probe = ExpertFSM(episode, config, start)
+    contacts = probe.contacts()
+    gripper_qpos = float(raw_env.sim.data.qpos[SU.gripper_qpos_index(raw_env)][0])
+    grasped = bool(contacts["fixed_jaw"]) and bool(contacts["moving_jaw"]) and gripper_qpos > -1.2
+    if not grasped:
+        start.update(object_origin=object_origin, object_bottom=object_bottom,
+                     hover_tcp=object_origin + np.array([0.0, 0.0, config.hover_height]) + alignment,
+                     grasp_tcp=np.array([object_origin[0], object_origin[1], grasp_z]) + alignment)
+    else:
+        start["grasp_tcp"] = nominal_grasp_tcp  # lift height is measured from the nominal grasp pose
+    qpos_index, _ = SU.arm_indices(raw_env)
+    start.update(start_phase="GRASP_HOLD" if grasped else "APPROACH_HOVER",
+                 restored={"rollout": rollout_path, "step": int(step), "grasped": grasped,
+                           "arm_qpos": raw_env.sim.data.qpos[qpos_index].tolist(),
+                           "wr0": float(raw_env.sim.data.qpos[qpos_index][4]),
+                           "gripper_qpos": gripper_qpos, "object_position": object_origin.tolist(),
+                           "object_quat_wxyz": object_quat.tolist(),
+                           "gripper_ramp": 1.0 if last_close else -1.0})
+    return start

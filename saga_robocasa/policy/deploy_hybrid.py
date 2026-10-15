@@ -37,6 +37,7 @@ import spot_utils as SU  # noqa: E402
 from controlled_episode import ControlledEpisode  # noqa: E402
 from expert_fsm import ExpertConfig, ExpertFSM  # noqa: E402
 from nav_expert import NavConfig, prepare_navigation_start  # noqa: E402
+from policy.dataset import ARM_LIMITS  # noqa: E402
 from policy.deploy_bc import preprocess  # noqa: E402
 from policy.evaluate_offline import load_policy  # noqa: E402
 from record_expert_demo import BASE_VELOCITY_SCALE, DATA_ROOT, Recorder  # noqa: E402
@@ -48,7 +49,7 @@ CHECKPOINTS = os.path.join(DATA_ROOT, "checkpoints")
 def predict(model, stats, checkpoint, recorder, t, pregrasp):
     pre = checkpoint["preprocessing"]
     points, proprio, goal = preprocess(recorder, stats, t, pre["num_points"], pre["seed"],
-                                       pre.get("goal_mode", "object_sink"), pregrasp)
+                                       pre.get("goal_mode", "object_sink"), pregrasp, pre.get("proprio_mode", "basic"))
     with torch.no_grad():
         normalized = model(points, proprio, goal).numpy()[0, 0]
     return (normalized + 1.0) / 2.0 * stats["action_span"] + stats["action_low"]
@@ -71,6 +72,8 @@ def main():
     parser.add_argument("--start-seed", type=int, required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--gate-steps", type=int, default=10)
+    parser.add_argument("--joint-safety", type=float, default=None, metavar="MARGIN",
+                        help="Joint-safety projection during manipulation (safety layer around the learned policy).")
     parser.add_argument("--nav-arm", choices=["hold", "zero"], default="hold",
                         help="Arm rule during navigation (see module docstring).")
     parser.add_argument("--max-navigation-steps", type=int, default=600)
@@ -113,7 +116,8 @@ def main():
     site0, rotation0 = SU.grip_site_pose(raw_env)
     yaw_matrix = lambda yaw: np.array([[np.cos(yaw), -np.sin(yaw), 0.0], [np.sin(yaw), np.cos(yaw), 0.0], [0.0, 0.0, 1.0]])  # noqa: E731
     arm_relative = (yaw_matrix(yaw0).T @ (site0 - base0), yaw_matrix(yaw0).T @ rotation0)
-    log = {k: [] for k in ("mode", "predicted", "wrapper_eef", "wrapper_base", "gripper_command", "base_error",
+    projection_count, projection_unresolved = 0, 0
+    log = {k: [] for k in ("mode", "arm_raw", "arm_projected", "projection_active", "predicted", "wrapper_eef", "wrapper_base", "gripper_command", "base_error",
                            "yaw_error", "object_position", "both_jaws")}
     mode, gate_streak, gate_step = "navigation", 0, None
     status, reason, fail_step = "timeout", f"max steps {args.max_steps}", None
@@ -124,6 +128,9 @@ def main():
         _, base_yaw = SU.base_pose(raw_env)
         action = SU.zero_action(episode.env)
         if mode == "navigation":
+            log["arm_raw"].append(np.zeros(6))
+            log["arm_projected"].append(np.zeros(6))
+            log["projection_active"].append(False)
             predicted = predict(nav_model, nav_stats, nav_checkpoint, recorder, t, pregrasp)
             velocity = predicted[6:9] * BASE_VELOCITY_SCALE
             action["action.base_motion"][:3] = np.clip(base_model.base_motion(*velocity, base_yaw), -1.0, 1.0)
@@ -138,7 +145,16 @@ def main():
                 action["action.end_effector_rotation"] = angular
         else:
             predicted = predict(manip_model, manip_stats, manip_checkpoint, recorder, t, pregrasp)
-            arm = np.clip(SU.arm_delta_base_to_origin(raw_env, predicted[:6]), -1.0, 1.0)
+            arm_base, active = predicted[:6].copy(), False
+            if args.joint_safety is not None:
+                arm_base, projection = SU.joint_safety_projection(raw_env, predicted[:6], ARM_LIMITS, args.joint_safety)
+                active = projection["active"]
+                projection_count += int(active)
+                projection_unresolved += int(projection["unresolved"])
+            log["arm_raw"].append(predicted[:6].copy())
+            log["arm_projected"].append(arm_base.copy())
+            log["projection_active"].append(active)
+            arm = np.clip(SU.arm_delta_base_to_origin(raw_env, arm_base), -1.0, 1.0)
             action["action.end_effector_position"] = arm[:3].astype(np.float32)
             action["action.end_effector_rotation"] = arm[3:].astype(np.float32)
             action["action.base_motion"][:3] = base_model.base_motion(0.0, 0.0, 0.0, base_yaw)  # exactly zero
@@ -208,6 +224,9 @@ def main():
         "grasp_success": grasped, "grasp_step": grasp_step,
         "placement_success": placed, "final_check_success": final_success,
         "status": status, "reason": reason, "failure_step": fail_step, "steps": len(log["mode"]),
+        "joint_safety_projection": None if args.joint_safety is None else {
+            "description": "safety layer around the learned manipulation policy: scales only the arm rotation delta",
+            "minimum_margin": args.joint_safety, "active_steps": projection_count, "unresolved_steps": projection_unresolved},
         "rules": {"navigation": "gripper forced OPEN, base from navigation policy, arm " + (
                       "held at its post-reset pose relative to the base by a fixed stabilizer (arm_hold_command)"
                       if args.nav_arm == "hold" else "OSC delta zero (uncontrolled in achieved mode)"),

@@ -55,7 +55,7 @@ import numpy as np
 import policy_cameras as PC
 import spot_utils as SU
 from controlled_episode import DEFAULT_OBJECT_XML, ControlledEpisode
-from expert_fsm import ExpertAbort, ExpertConfig, ExpertFSM, prepare_start
+from expert_fsm import ExpertAbort, ExpertConfig, ExpertFSM, prepare_restored_manipulation_start, prepare_start
 from nav_expert import PHASES, NavConfig, NavExpertFSM, prepare_navigation_start, prepare_restored_start
 
 
@@ -237,6 +237,9 @@ def main():
                         help="DAgger recovery: policy rollout .npz whose visited state to restore (implies --navigate).")
     parser.add_argument("--restore-step", type=int, default=None)
     parser.add_argument("--restore-reason", default=None, help="Why this state was chosen (stored in metadata).")
+    parser.add_argument("--restore-manipulation", action="store_true",
+                        help="Restore a manipulation-phase state (no navigation); expert recovers manipulation only.")
+    parser.add_argument("--recovery-kind", default=None, help="Dataset label for restored manipulation recoveries.")
     parser.add_argument("--nav-near-distance", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
     parser.add_argument("--nav-near-yaw", type=float, default=None)
     parser.add_argument("--subdir", default="demos", help="Output subdirectory for successful episodes.")
@@ -250,7 +253,11 @@ def main():
     episode = ControlledEpisode(config.seed, args.object_xml, policy_camera=True)
     raw_env = episode.raw_env
     nav_config, nav_plan = None, None
-    if args.restore_from:
+    if args.restore_from and args.restore_manipulation:
+        start = prepare_restored_manipulation_start(episode, config, args.restore_from, args.restore_step)
+        print(f"Restored manipulation state from {args.restore_from} step {args.restore_step}: "
+              f"grasped {start['restored']['grasped']}, wr0 {start['restored']['wr0']:.3f}, start phase {start['start_phase']}")
+    elif args.restore_from:
         args.navigate = True
         nav_config = NavConfig(start_seed=args.nav_start_seed)
         start, nav_plan = prepare_restored_start(episode, config, nav_config, args.restore_from, args.restore_step)
@@ -348,6 +355,10 @@ def main():
         "layout_style": [int(raw_env.layout_id), int(raw_env.style_id)],
         "expert_config": dataclasses.asdict(config),
         "phases": list(PHASES), "phase_events": fsm.events, "plans": fsm.plans,
+        "recovery": None if not args.restore_manipulation else {
+            "kind": args.recovery_kind or "manipulation_recovery", "source_rollout": args.restore_from,
+            "source_step": args.restore_step, "reason": args.restore_reason, **start["restored"],
+            "start_phase": start["start_phase"]},
         "navigation": None if nav_plan is None else {
             "config": dataclasses.asdict(nav_config), "start_xy": nav_plan["xy"].tolist(), "start_yaw": nav_plan["yaw"],
             "path": [list(map(float, p)) for p in nav_plan["path"]], "distance": nav_plan["distance"],

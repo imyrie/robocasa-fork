@@ -35,13 +35,13 @@ import spot_utils as SU  # noqa: E402
 from controlled_episode import ControlledEpisode  # noqa: E402
 from expert_fsm import ExpertConfig, ExpertFSM, prepare_start  # noqa: E402
 from nav_expert import NavConfig, prepare_navigation_start  # noqa: E402
-from policy.dataset import pregrasp_features, to_base_frame  # noqa: E402
+from policy.dataset import ARM_LIMITS, extended_proprio, pregrasp_features, to_base_frame  # noqa: E402
 from policy.evaluate_offline import load_policy  # noqa: E402
 from record_expert_demo import BASE_VELOCITY_SCALE, DATA_ROOT, Recorder, state_hash  # noqa: E402
 from robocasa.utils import object_utils as OU  # noqa: E402
 
 
-def preprocess(recorder, stats, t, num_points, seed, goal_mode="object_sink", pregrasp=None):
+def preprocess(recorder, stats, t, num_points, seed, goal_mode="object_sink", pregrasp=None, proprio_mode="basic"):
     """Identical to DemoDataset.__getitem__ for episode_id 0, using the recorder's latest observation."""
     obs = recorder.obs
     base = obs["base_pose"][-1].astype(np.float64)
@@ -50,8 +50,13 @@ def preprocess(recorder, stats, t, num_points, seed, goal_mode="object_sink", pr
     labels = obs["point_cloud_labels"][-1]
     choice = np.random.default_rng((seed, 0, t)).choice(len(points), num_points, replace=False)
     one_hot = np.stack([labels == 1, labels == 2, labels == 3], axis=-1).astype(np.float32)
-    proprio = np.concatenate([obs["arm_qpos"][-1], obs["gripper_qpos"][-1],
-                              to_base_frame(obs["tcp_position"][-1], base)]).astype(np.float32)
+    proprio_parts = [obs["arm_qpos"][-1], obs["gripper_qpos"][-1], to_base_frame(obs["tcp_position"][-1], base)]
+    if proprio_mode == "extended":
+        proprio_parts.append(extended_proprio(
+            obs["arm_qpos"][-1][None].astype(np.float64), base[None], obs["tcp_position"][-1][None].astype(np.float64),
+            obs["eef_site_quat_wxyz"][-1][None], obs["object_position"][-1][None].astype(np.float64),
+            obs["object_quat_wxyz"][-1][None])[0])
+    proprio = np.concatenate(proprio_parts).astype(np.float32)
     goal_parts = [to_base_frame(obs["object_position"][-1], base), to_base_frame(obs["sink_interior_center"][-1], base)]
     if goal_mode == "object_sink_pregrasp":
         goal_parts.append(pregrasp_features(base[None], np.asarray(pregrasp[0]), float(pregrasp[1]))[0])
@@ -74,6 +79,9 @@ def main():
                         help="navigation: success = within the nav gate for --gate-steps consecutive steps "
                              "without closing the gripper; stops there.")
     parser.add_argument("--gate-steps", type=int, default=10)
+    parser.add_argument("--joint-safety", type=float, default=None, metavar="MARGIN",
+                        help="Joint-safety projection (safety layer, not an expert action): scale only the arm rotation "
+                             "delta so no predicted joint margin falls below MARGIN rad.")
     parser.add_argument("--zero-base", action="store_true",
                         help="Command zero base velocity (manipulation-only evaluation from a pregrasp state).")
     parser.add_argument("--base-deadzone", type=float, nargs=2, default=None, metavar=("SPEED", "YAW_RATE"),
@@ -146,12 +154,15 @@ def main():
            "yaw_error": [], "object_position": [], "jaws": []}
     status, reason, grasped, first_close_step, no_contact_steps = "timeout", f"max steps {args.max_steps}", False, None, 0
     gate_streak, gate_step = 0, None
+    projection_count, projection_unresolved = 0, 0
+    log.update(arm_raw=[], arm_projected=[], projection_active=[])
     previous_normalized = None
     clip_events, rate_events = 0, 0
     wrapper_obs = episode.env.unwrapped.get_observation(raw_env._get_observations(force_update=True))
     for t in range(args.max_steps):
         recorder.observe(wrapper_obs, fsm)
-        points, proprio, goal = preprocess(recorder, stats, t, num_points, seed, goal_mode, pregrasp)
+        points, proprio, goal = preprocess(recorder, stats, t, num_points, seed, goal_mode, pregrasp,
+                                           checkpoint["preprocessing"].get("proprio_mode", "basic"))
         with torch.no_grad():
             raw = model(points, proprio, goal).numpy()[0, 0]
         normalized = raw
@@ -172,7 +183,17 @@ def main():
         _, base_yaw = SU.base_pose(raw_env)
 
         action = SU.zero_action(episode.env)
-        arm = np.clip(SU.arm_delta_base_to_origin(raw_env, predicted[:6]), -1.0, 1.0)
+        arm_base = predicted[:6].copy()
+        projection_active = False
+        if args.joint_safety is not None:
+            arm_base, projection = SU.joint_safety_projection(raw_env, predicted[:6], ARM_LIMITS, args.joint_safety)
+            projection_active = projection["active"]
+            projection_count += int(projection_active)
+            projection_unresolved += int(projection["unresolved"])
+        log["arm_raw"].append(predicted[:6].copy())
+        log["arm_projected"].append(arm_base.copy())
+        log["projection_active"].append(projection_active)
+        arm = np.clip(SU.arm_delta_base_to_origin(raw_env, arm_base), -1.0, 1.0)
         action["action.end_effector_position"] = arm[:3].astype(np.float32)
         action["action.end_effector_rotation"] = arm[3:].astype(np.float32)
         velocity = predicted[6:9] * BASE_VELOCITY_SCALE
@@ -244,6 +265,9 @@ def main():
         "scope": ("closed-loop from the exact training initial state of the demo (not generalization)" if initial_match
                   else f"closed-loop from a {args.start} start (seed {args.start_seed}) different from the demo's"),
         "task": args.task, "start": args.start, "start_seed": args.start_seed,
+        "joint_safety_projection": None if args.joint_safety is None else {
+            "description": "safety layer around the learned policy: scales only the arm rotation delta",
+            "minimum_margin": args.joint_safety, "active_steps": projection_count, "unresolved_steps": projection_unresolved},
         "base_handling": "zero" if args.zero_base else (f"deadzone {args.base_deadzone}" if args.base_deadzone else "policy"),
         "base_drift_m": float(np.linalg.norm(recorder.obs["base_pose"][-1][:2] - recorder.obs["base_pose"][0][:2])),
         "navigation_gate": {"position": gate_position, "yaw": gate_yaw, "reached_step": gate_step},

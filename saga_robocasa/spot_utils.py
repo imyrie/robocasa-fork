@@ -652,3 +652,69 @@ def arm_delta_base_to_origin(raw_env, delta_base):
     base_to_origin = np.asarray(controller.origin_ori).T @ base_rotation
     delta_base = np.asarray(delta_base, dtype=np.float64)
     return np.concatenate([base_to_origin @ delta_base[:3], base_to_origin @ delta_base[3:6]])
+
+
+# --------------------------------------------------------------------------- joint-limit safety
+
+
+def joint_motion_map(model, data, site_id, dof_index, base_rotation, damping=0.02,
+                     output_scale=(0.05, 0.5)):
+    """
+    First-order map M (6x6) from a normalized base-frame arm delta a (policy action[:6]) to arm joint
+    motion: dq ~= M @ a. The OSC turns a into a world-frame goal offset
+    [output_scale[0] * R_base @ a[:3], output_scale[1] * R_base @ a[3:]] (Spot's OSC origin frame
+    rotates with sh0, but R_origin @ (R_origin^T R_base) = R_base), and dq = J^+ @ offset with J the
+    eef-site Jacobian (position; rotation) over the arm dofs at the current state.
+    """
+    jacp = np.zeros((3, model.nv))
+    jacr = np.zeros((3, model.nv))
+    mujoco.mj_jacSite(model, data, jacp, jacr, site_id)
+    J = np.vstack([jacp[:, dof_index], jacr[:, dof_index]])
+    J_pinv = J.T @ np.linalg.inv(J @ J.T + damping ** 2 * np.eye(6))
+    scale = np.zeros((6, 6))
+    scale[:3, :3] = output_scale[0] * base_rotation
+    scale[3:, 3:] = output_scale[1] * base_rotation
+    return J_pinv @ scale
+
+
+def joint_safety_projection(raw_env, arm_action_base, limits, minimum_margin=0.08):
+    """
+    Safety layer around a learned policy (not an expert action): predict the next arm joint margins
+    from the live Jacobian (q_next ~= q + M @ a). If a predicted margin would fall below
+    `minimum_margin` while the action reduces it, scale ONLY the rotation part a[3:6] by the largest
+    s in [0, 1] that keeps every margin >= minimum_margin (or at its current value if already below).
+    Translation is never changed. Returns (projected action, info).
+    """
+    model, data = raw_env.sim.model._model, raw_env.sim.data._data
+    qpos_index, dof_index = arm_indices(raw_env)
+    site_id = raw_env.robots[0].eef_site_id["right"]
+    base_rotation = np.array(data.site_xmat[raw_env.sim.model.site_name2id(
+        raw_env.robots[0].robot_model.base.correct_naming("center"))]).reshape(3, 3)
+    mujoco.mj_kinematics(model, data)
+    mujoco.mj_comPos(model, data)
+    M = joint_motion_map(model, data, site_id, dof_index, base_rotation)
+    q = data.qpos[qpos_index].copy()
+    a = np.asarray(arm_action_base, dtype=np.float64)
+    dq_translation = M[:, :3] @ a[:3]
+    dq_rotation = M[:, 3:] @ a[3:6]
+    lower, upper = limits[:, 0], limits[:, 1]
+    margin = np.minimum(q - lower, upper - q)
+    toward_upper = (upper - q) <= (q - lower)  # which limit is the binding one
+    direction = np.where(toward_upper, 1.0, -1.0)  # dq along `direction` reduces the margin
+    predicted = margin - direction * (dq_translation + dq_rotation)
+    scale = 1.0
+    unsafe = predicted < minimum_margin
+    for j in np.flatnonzero(unsafe):
+        rotation_effect = direction[j] * dq_rotation[j]
+        if rotation_effect <= 0:
+            continue  # rotation is not what reduces this margin
+        floor = min(minimum_margin, margin[j])
+        allowed = (margin[j] - floor - direction[j] * dq_translation[j]) / rotation_effect
+        scale = min(scale, float(np.clip(allowed, 0.0, 1.0)))
+    projected = a.copy()
+    projected[3:6] *= scale
+    final = margin - direction * (dq_translation + scale * dq_rotation)
+    info = {"active": bool(scale < 1.0), "scale": scale, "margin": margin.tolist(),
+            "predicted_margin_raw": predicted.tolist(), "predicted_margin_projected": final.tolist(),
+            "unresolved": bool(np.any(final < np.minimum(minimum_margin, margin) - 1e-9))}
+    return projected, info

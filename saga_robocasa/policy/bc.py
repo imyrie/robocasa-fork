@@ -25,7 +25,14 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from policy.dataset import DemoDataset, balanced_weights, list_demos  # noqa: E402
+from policy.dataset import DemoDataset, balanced_weights, list_demos, sampling_report  # noqa: E402
+
+
+def parse_boosts(text):
+    """'A=3,B=2' -> {'A': 3.0, 'B': 2.0}"""
+    if not text:
+        return None
+    return {key: float(value) for key, value in (item.split("=") for item in text.split(","))}
 
 
 class PointNetEncoder(nn.Module):
@@ -68,6 +75,13 @@ def main():
     parser.add_argument("--phase-subset", choices=["navigation", "manipulation"], default=None)
     parser.add_argument("--balanced", action="store_true",
                         help="Source/phase-balanced sampling with alignment and transition oversampling.")
+    parser.add_argument("--proprio-mode", choices=["basic", "extended"], default="basic")
+    parser.add_argument("--phase-boost", default=None, help="Extra sampling weight per phase, e.g. TRANSIT=3,RELEASE_DESCEND=3")
+    parser.add_argument("--source-boost", default=None, help="Extra sampling weight per source, e.g. hybrid_transport_recovery=3")
+    parser.add_argument("--joint-penalty", type=float, default=0.0,
+                        help="Weight of the auxiliary penalty on predicted joint motion further toward a limit when a "
+                             "joint is within --joint-band of the demonstrated range (requires joint-map caches).")
+    parser.add_argument("--joint-band", type=float, default=0.10)
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--points", type=int, default=1024)
     parser.add_argument("--batch", type=int, default=64)
@@ -91,14 +105,20 @@ def main():
     train_prefixes = [p for p in prefixes if os.path.basename(p) not in held_out]
     val_prefixes = [p for p in prefixes if os.path.basename(p) in held_out]
     options = dict(horizon=args.horizon, num_points=args.points, seed=args.seed, goal_mode=args.goal_mode,
-                   phase_subset=args.phase_subset)
+                   phase_subset=args.phase_subset, proprio_mode=args.proprio_mode, joint_maps=args.joint_penalty > 0)
     dataset = DemoDataset(train_prefixes, **options)
     val_dataset = DemoDataset(val_prefixes, stats=dataset.stats, **options) if val_prefixes else None
     print(f"Train: {len(dataset.episodes)} episodes ({', '.join(e['name'] for e in dataset.episodes)}), {len(dataset)} samples")
     if val_dataset:
         print(f"Validation (held-out episodes): {', '.join(e['name'] for e in val_dataset.episodes)}, {len(val_dataset)} samples")
     if args.balanced:
-        weights = torch.as_tensor(balanced_weights(dataset), dtype=torch.double)
+        weight_array = balanced_weights(dataset, phase_boost=parse_boosts(args.phase_boost),
+                                        source_boost=parse_boosts(args.source_boost))
+        report = sampling_report(dataset, weight_array)
+        print("Training samples / sampling mass by source and phase:")
+        for (kind, name), (count, mass) in sorted(report.items()):
+            print(f"  {kind:<6} {name:<28} samples {count:6d}  mass {mass * 100:5.1f}%")
+        weights = torch.as_tensor(weight_array, dtype=torch.double)
         sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True,
                                                          generator=torch.Generator().manual_seed(args.seed))
         loader = DataLoader(dataset, batch_size=args.batch, sampler=sampler, num_workers=0, drop_last=True)
@@ -113,6 +133,14 @@ def main():
     print(f"device {device} (torch threads {torch.get_num_threads()}), parameters {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
 
     names = ["eef_dx", "eef_dy", "eef_dz", "eef_drx", "eef_dry", "eef_drz", "base_fwd", "base_side", "base_yaw", "gripper"]
+    demo_qpos = np.concatenate([e["arm_qpos"] for e in dataset.episodes])
+    safe_low = torch.as_tensor(demo_qpos.min(axis=0), device=device)
+    safe_high = torch.as_tensor(demo_qpos.max(axis=0), device=device)
+    action_low = torch.as_tensor(dataset.stats["action_low"], device=device, dtype=torch.float32)
+    action_span = torch.as_tensor(dataset.stats["action_span"], device=device, dtype=torch.float32)
+    if args.joint_penalty > 0:
+        print("Demonstrated arm joint range (penalty band edges):",
+              np.round(demo_qpos.min(axis=0), 3).tolist(), np.round(demo_qpos.max(axis=0), 3).tolist())
     step, started, history = 0, time.time(), []
     while step < args.steps:
         for batch in loader:
@@ -122,6 +150,15 @@ def main():
             mask = batch["action_mask"][..., None]
             per_component = (squared * mask).sum(dim=(0, 1)) / mask.sum()
             loss = per_component.mean()
+            joint_term = torch.zeros((), device=device)
+            if args.joint_penalty > 0:
+                arm_delta = (prediction[:, 0, :6] + 1.0) / 2.0 * action_span[:6] + action_low[:6]
+                dq = torch.einsum("bij,bj->bi", batch["joint_map"], arm_delta)
+                q = batch["arm_qpos"]
+                near_high = (q > safe_high - args.joint_band).float()
+                near_low = (q < safe_low + args.joint_band).float()
+                joint_term = (near_high * torch.relu(dq) + near_low * torch.relu(-dq)).sum(dim=1).mean()
+                loss = loss + args.joint_penalty * joint_term
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -129,8 +166,9 @@ def main():
             step += 1
             if step % 250 == 0 or step == 1:
                 components = per_component.detach().cpu().numpy()
-                history.append({"step": step, "loss": float(loss), "per_component": components.tolist()})
-                print(f"step {step:5d} loss {float(loss):.5f} ({time.time() - started:.0f}s) | "
+                history.append({"step": step, "loss": float(loss), "per_component": components.tolist(),
+                                "joint_penalty_term": float(joint_term)})
+                print(f"step {step:5d} loss {float(loss):.5f} joint {float(joint_term):.5f} ({time.time() - started:.0f}s) | "
                       + " ".join(f"{n}={c:.4f}" for n, c in zip(names, components)))
             if step >= args.steps:
                 break
@@ -175,10 +213,16 @@ def main():
                          "point_channels": ["x", "y", "z", "is_object", "is_sink", "is_robot"]},
         "preprocessing": {"num_points": args.points, "point_frame": "robot base frame, standardized",
                           "point_sampling": "np.random.default_rng((seed, episode_id, t)).choice(2048, num_points)",
-                          "seed": args.seed, "proprio": "arm_qpos(6), gripper_qpos(1), tcp_in_base(3)",
+                          "seed": args.seed, "proprio": "arm_qpos(6), gripper_qpos(1), tcp_in_base(3)" + (
+                              " + joint-limit margins(6), tcp rotation cols(6), object-tcp in base(3), object up-axis(3)"
+                              if args.proprio_mode == "extended" else ""),
                           "goal": "object position and sink interior centre in base frame"
                                   + (" + pregrasp error (base frame) and yaw error (sin, cos)" if args.goal_mode == "object_sink_pregrasp" else ""),
                           "goal_mode": args.goal_mode, "phase_subset": args.phase_subset,
+                          "proprio_mode": args.proprio_mode,
+                          "joint_penalty": {"weight": args.joint_penalty, "band": args.joint_band,
+                                            "demonstrated_low": demo_qpos.min(axis=0).tolist(),
+                                            "demonstrated_high": demo_qpos.max(axis=0).tolist()},
                           "balanced_sampling": args.balanced,
                           "actions": "action_policy, per-dim min/max scaled to [-1, 1]",
                           "phase_input": False},

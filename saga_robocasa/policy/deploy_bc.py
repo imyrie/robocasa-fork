@@ -35,13 +35,13 @@ import spot_utils as SU  # noqa: E402
 from controlled_episode import ControlledEpisode  # noqa: E402
 from expert_fsm import ExpertConfig, ExpertFSM, prepare_start  # noqa: E402
 from nav_expert import NavConfig, prepare_navigation_start  # noqa: E402
-from policy.dataset import to_base_frame  # noqa: E402
+from policy.dataset import pregrasp_features, to_base_frame  # noqa: E402
 from policy.evaluate_offline import load_policy  # noqa: E402
 from record_expert_demo import BASE_VELOCITY_SCALE, DATA_ROOT, Recorder, state_hash  # noqa: E402
 from robocasa.utils import object_utils as OU  # noqa: E402
 
 
-def preprocess(recorder, stats, t, num_points, seed):
+def preprocess(recorder, stats, t, num_points, seed, goal_mode="object_sink", pregrasp=None):
     """Identical to DemoDataset.__getitem__ for episode_id 0, using the recorder's latest observation."""
     obs = recorder.obs
     base = obs["base_pose"][-1].astype(np.float64)
@@ -52,8 +52,10 @@ def preprocess(recorder, stats, t, num_points, seed):
     one_hot = np.stack([labels == 1, labels == 2, labels == 3], axis=-1).astype(np.float32)
     proprio = np.concatenate([obs["arm_qpos"][-1], obs["gripper_qpos"][-1],
                               to_base_frame(obs["tcp_position"][-1], base)]).astype(np.float32)
-    goal = np.concatenate([to_base_frame(obs["object_position"][-1], base),
-                           to_base_frame(obs["sink_interior_center"][-1], base)]).astype(np.float32)
+    goal_parts = [to_base_frame(obs["object_position"][-1], base), to_base_frame(obs["sink_interior_center"][-1], base)]
+    if goal_mode == "object_sink_pregrasp":
+        goal_parts.append(pregrasp_features(base[None], np.asarray(pregrasp[0]), float(pregrasp[1]))[0])
+    goal = np.concatenate(goal_parts).astype(np.float32)
     return (torch.from_numpy(np.concatenate([points[choice], one_hot[choice]], axis=1)[None].astype(np.float32)),
             torch.from_numpy(((proprio - stats["proprio_mean"]) / stats["proprio_std"])[None]).float(),
             torch.from_numpy(((goal - stats["goal_mean"]) / stats["goal_std"])[None]).float())
@@ -62,7 +64,22 @@ def preprocess(recorder, stats, t, num_points, seed):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("checkpoint")
-    parser.add_argument("--demo", required=True, help="Recorded demo whose initial state to start from.")
+    parser.add_argument("--demo", required=True,
+                        help="Recorded demo providing configuration (and, with --start demo, the exact initial state).")
+    parser.add_argument("--start", choices=["demo", "far", "near", "perturb"], default="demo",
+                        help="demo: exact initial state of --demo; far/near: navigation start with --start-seed; "
+                             "perturb: fixed-base pregrasp start with perturb seed --start-seed.")
+    parser.add_argument("--start-seed", type=int, default=0)
+    parser.add_argument("--task", choices=["full", "navigation"], default="full",
+                        help="navigation: success = within the nav gate for --gate-steps consecutive steps "
+                             "without closing the gripper; stops there.")
+    parser.add_argument("--gate-steps", type=int, default=10)
+    parser.add_argument("--zero-base", action="store_true",
+                        help="Command zero base velocity (manipulation-only evaluation from a pregrasp state).")
+    parser.add_argument("--base-deadzone", type=float, nargs=2, default=None, metavar=("SPEED", "YAW_RATE"),
+                        help="Treat desired base speed (m/s) / yaw rate (rad/s) below these as zero before the "
+                             "deadband-compensating BaseActionModel (which otherwise turns tiny predictions into "
+                             ">= 0.25 commands that really move the base).")
     parser.add_argument("--name", default="eval")
     parser.add_argument("--max-steps", type=int, default=1200)
     parser.add_argument("--threads", type=int, default=16)
@@ -93,13 +110,25 @@ def main():
               np.round(rate_limit, 4).tolist())
 
     episode = ControlledEpisode(config.seed, meta["object_xml"], policy_camera=True)
-    if meta.get("navigation"):
-        start, _ = prepare_navigation_start(episode, config, NavConfig(**meta["navigation"]["config"]))
+    nav_defaults = (meta.get("navigation") or {}).get("config", {})
+    if args.start == "demo":
+        if meta.get("navigation"):
+            start, _ = prepare_navigation_start(episode, config, NavConfig(**nav_defaults))
+        else:
+            start = prepare_start(episode, config)
+    elif args.start in ("far", "near"):
+        nav_config = NavConfig(**{**nav_defaults, "start_seed": args.start_seed, "start_mode": args.start})
+        start, _ = prepare_navigation_start(episode, config, nav_config)
     else:
+        config = dataclasses.replace(config, perturb_seed=args.start_seed)
         start = prepare_start(episode, config)
     raw_env = episode.raw_env
     initial_match = state_hash(raw_env) == meta["initial_state_sha256"]
-    print(f"Initial state matches {os.path.basename(args.demo)}: {initial_match}")
+    print(f"Start {args.start} (seed {args.start_seed}); identical to {os.path.basename(args.demo)}'s initial state: {initial_match}")
+    goal_mode = checkpoint["preprocessing"].get("goal_mode", "object_sink")
+    pregrasp = (np.asarray(start["base_xy"]), float(start["base_yaw"]))
+    gate_position = nav_defaults.get("nav_position_tolerance", 0.01)
+    gate_yaw = nav_defaults.get("nav_yaw_tolerance", 0.01)
 
     base_model = SU.BaseActionModel(meta["base_action_model"])
     rig = PC.CameraRig(raw_env, [PC.EXTERNAL_CAMERA, PC.WRIST_CAMERA], meta["cameras"]["image_size"], meta["cameras"]["image_size"])
@@ -116,12 +145,13 @@ def main():
     log = {"predicted_raw": [], "predicted_clipped": [], "predicted": [], "wrapper_eef": [], "wrapper_base": [], "gripper_command": [], "base_error": [],
            "yaw_error": [], "object_position": [], "jaws": []}
     status, reason, grasped, first_close_step, no_contact_steps = "timeout", f"max steps {args.max_steps}", False, None, 0
+    gate_streak, gate_step = 0, None
     previous_normalized = None
     clip_events, rate_events = 0, 0
     wrapper_obs = episode.env.unwrapped.get_observation(raw_env._get_observations(force_update=True))
     for t in range(args.max_steps):
         recorder.observe(wrapper_obs, fsm)
-        points, proprio, goal = preprocess(recorder, stats, t, num_points, seed)
+        points, proprio, goal = preprocess(recorder, stats, t, num_points, seed, goal_mode, pregrasp)
         with torch.no_grad():
             raw = model(points, proprio, goal).numpy()[0, 0]
         normalized = raw
@@ -146,6 +176,13 @@ def main():
         action["action.end_effector_position"] = arm[:3].astype(np.float32)
         action["action.end_effector_rotation"] = arm[3:].astype(np.float32)
         velocity = predicted[6:9] * BASE_VELOCITY_SCALE
+        if args.zero_base:
+            velocity = np.zeros(3)
+        elif args.base_deadzone is not None:
+            if np.linalg.norm(velocity[:2]) < args.base_deadzone[0]:
+                velocity[:2] = 0.0
+            if abs(velocity[2]) < args.base_deadzone[1]:
+                velocity[2] = 0.0
         action["action.base_motion"][:3] = np.clip(base_model.base_motion(*velocity, base_yaw), -1.0, 1.0)
         close = predicted[9] > 0.0
         action["action.gripper_close"] = SU.CLOSE_GRIPPER if close else SU.OPEN_GRIPPER
@@ -183,7 +220,16 @@ def main():
                 break
         else:
             no_contact_steps = 0
-        if raw_env._check_success():
+        if args.task == "navigation":
+            if first_close_step is not None:
+                status, reason = "fail", f"gripper closed at step {first_close_step} before the navigation gate"
+                break
+            within = log["base_error"][-1] <= gate_position and log["yaw_error"][-1] <= gate_yaw
+            gate_streak = gate_streak + 1 if within else 0
+            if gate_streak >= args.gate_steps:
+                status, reason, gate_step = "success", f"navigation gate held for {args.gate_steps} steps", t
+                break
+        elif raw_env._check_success():
             status, reason = "success", "_check_success() True"
             break
         if t % 100 == 0:
@@ -195,7 +241,12 @@ def main():
     placed = bool(OU.obj_inside_of(raw_env, "obj", raw_env.sink, partial_check=True))
     base_error = np.asarray(log["base_error"])
     report = {
-        "scope": "closed-loop replay from the TRAINING initial state of the demo (not generalization)",
+        "scope": ("closed-loop from the exact training initial state of the demo (not generalization)" if initial_match
+                  else f"closed-loop from a {args.start} start (seed {args.start_seed}) different from the demo's"),
+        "task": args.task, "start": args.start, "start_seed": args.start_seed,
+        "base_handling": "zero" if args.zero_base else (f"deadzone {args.base_deadzone}" if args.base_deadzone else "policy"),
+        "base_drift_m": float(np.linalg.norm(recorder.obs["base_pose"][-1][:2] - recorder.obs["base_pose"][0][:2])),
+        "navigation_gate": {"position": gate_position, "yaw": gate_yaw, "reached_step": gate_step},
         "checkpoint": args.checkpoint, "demo": os.path.basename(args.demo), "initial_state_matches": initial_match,
         "status": status, "reason": reason, "steps": len(base_error), "expert_steps": meta["transitions"],
         "navigation": {"min_base_error_m": float(base_error.min()),

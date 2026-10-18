@@ -139,6 +139,16 @@ def prepare_start(episode, config):
         base_xy = base_xy + base_shift
         base_yaw_target = spawn_yaw + yaw_shift
         perturbation = {"object_xy": object_shift.tolist(), "base_xy": base_shift.tolist(), "base_yaw": yaw_shift}
+    return manipulation_start(raw_env, config, base_xy, base_yaw_target, spawn_yaw, perturbation)
+
+
+def manipulation_start(raw_env, config, base_xy, base_yaw_target, spawn_yaw, perturbation=None):
+    """
+    Teleport the base to the pregrasp pose (base_xy, base_yaw_target), solve the arm's ready pose
+    by IK and derive the hover/grasp targets from the object's current pose; syncs the
+    controllers. Shared by prepare_start() and the object-relative benchmark starts
+    (benchmark/episodes.py).
+    """
     object_origin = np.array(raw_env.sim.data.body_xpos[raw_env.obj_body_id["obj"]])
     object_bottom = object_collision_bottom(raw_env, "obj")
 

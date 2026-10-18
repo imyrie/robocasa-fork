@@ -497,6 +497,22 @@ def arm_hold_command(raw_env, site_target, rotation_target, position_gain, rotat
 # --------------------------------------------------------------------------- rendering
 
 
+def progress_scene_option(show_collision=False):
+    """
+    Scene option for free-camera progress/inspection renders: visual geoms (groups 1 and 2) only.
+    MuJoCo's default option also draws geom group 0, where RoboCasa's Counter fixture puts its
+    collision boxes with random semi-transparent rgba (the coloured patches in older progress
+    videos), and draws sites. Rendering only; physics and the policy cameras
+    (policy_cameras.CameraRig, which already hides both) are unaffected.
+    """
+    option = mujoco.MjvOption()
+    option.geomgroup[:] = 0
+    option.geomgroup[1] = option.geomgroup[2] = 1
+    option.geomgroup[0] = int(show_collision)
+    option.sitegroup[:] = 0
+    return option
+
+
 def render_free_camera(raw_env, path, look_at, azimuth_deg, elevation_deg=-25.0, distance=2.2, size=512):
     """Render an external free-camera view (progress videos/inspection only, not policy data)."""
     from PIL import Image
@@ -509,7 +525,7 @@ def render_free_camera(raw_env, path, look_at, azimuth_deg, elevation_deg=-25.0,
     camera.type = mujoco.mjtCamera.mjCAMERA_FREE
     camera.lookat[:] = look_at
     camera.distance, camera.elevation, camera.azimuth = distance, elevation_deg, azimuth_deg
-    renderer.update_scene(data, camera=camera)
+    renderer.update_scene(data, camera=camera, scene_option=progress_scene_option())
     Image.fromarray(renderer.render()).save(path)
     renderer.close()
 
@@ -534,12 +550,13 @@ class FrameRecorder:
         self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
         self.camera.lookat[:] = look_at
         self.camera.distance, self.camera.elevation, self.camera.azimuth = distance, elevation_deg, azimuth_deg
+        self.option = progress_scene_option()
         self.count = 0
 
     def capture(self):
         from PIL import Image
 
-        self.renderer.update_scene(self.raw_env.sim.data._data, camera=self.camera)
+        self.renderer.update_scene(self.raw_env.sim.data._data, camera=self.camera, scene_option=self.option)
         path = os.path.join(self.directory, f"frame_{self.count:05d}.jpg")
         Image.fromarray(self.renderer.render()).save(path, quality=self.quality)
         self.count += 1

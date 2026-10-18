@@ -243,6 +243,7 @@ def main():
     parser.add_argument("--nav-near-distance", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
     parser.add_argument("--nav-near-yaw", type=float, default=None)
     parser.add_argument("--subdir", default="demos", help="Output subdirectory for successful episodes.")
+    parser.add_argument("--data-root", default=DATA_ROOT, help="Root for subdir/, failures/ and progress/ (default: saga_robocasa/data).")
     for field in dataclasses.fields(ExpertConfig):
         if isinstance(field.default, (int, float)) and not isinstance(field.default, bool):
             parser.add_argument("--" + field.name.replace("_", "-"), type=type(field.default), default=field.default)
@@ -297,7 +298,7 @@ def main():
 
     progress = None
     if args.progress_video:
-        progress = SU.FrameRecorder(raw_env, os.path.join(DATA_ROOT, "progress", args.name),
+        progress = SU.FrameRecorder(raw_env, os.path.join(args.data_root, "progress", args.name),
                                     look_at=workspace_center + np.array([0.0, 0.0, 0.05]),
                                     azimuth_deg=np.degrees(start["base_yaw"]) + 55.0, elevation_deg=-28.0, distance=1.9)
 
@@ -414,7 +415,7 @@ def main():
         "alignment": "obs_* arrays have T+1 entries (obs[t] before action[t]); all other arrays have T entries",
     }
 
-    directory = os.path.join(DATA_ROOT, args.subdir if success else "failures")
+    directory = os.path.join(args.data_root, args.subdir if success else "failures")
     os.makedirs(directory, exist_ok=True)
     np.savez_compressed(os.path.join(directory, f"{args.name}.npz"), **arrays)
     with open(os.path.join(directory, f"{args.name}.json"), "w") as file:
@@ -423,7 +424,7 @@ def main():
     for phase, info in fsm.events:
         print(f"  {phase}: {info}")
     if progress is not None:
-        progress.write_video(os.path.join(DATA_ROOT, "progress", f"{args.name}.mp4"))
+        progress.write_video(os.path.join(args.data_root, "progress", f"{args.name}.mp4"))
         progress.close()
     rig.close()
     episode.close()

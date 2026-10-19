@@ -130,7 +130,7 @@ def test_manifest_ids_seeds_and_split():
     heldout = {e["perturbation_seed"] for e in episodes if e["split"] == "heldout"}
     assert len(train) == len(heldout) == 50 and not train & heldout
     generation = json.load(open(MANIFEST.replace(".json", "_generation.json")))
-    rejected = {r["perturbation_seed"] for r in generation["rejections"]}
+    rejected = {r[2] for r in generation["rejections"]}  # [episode, attempt, candidate seed, reason code, ...]
     assert not rejected & (train | heldout)
 
 

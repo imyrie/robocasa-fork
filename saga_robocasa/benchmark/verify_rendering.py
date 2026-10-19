@@ -132,12 +132,15 @@ def main():
         free = FreeCamera(raw_env)
         old_rgb, old_kinds, old_ids = free.render(data, camera, mujoco.MjvOption())
         new_rgb, new_kinds, new_ids = free.render(data, camera, SU.progress_scene_option())
-        # Wide view that includes the robot at its far start.
+        # Robot view: look at the robot at its far start from above the free corridor towards the goal
+        # (the camera sits on the goal side of the robot, where the start was verified collision-free).
         wide = mujoco.MjvCamera()
         wide.type = mujoco.mjtCamera.mjCAMERA_FREE
         base_position, base_yaw = SU.base_pose(raw_env)
-        wide.lookat[:] = 0.5 * (base_position + start["object_origin"])
-        wide.distance, wide.elevation, wide.azimuth = 3.6, -40.0, np.degrees(base_yaw) + 70.0
+        toward_robot = base_position[:2] - np.asarray(start["base_xy"])
+        wide.lookat[:] = base_position + np.array([0.0, 0.0, 0.3])
+        wide.distance, wide.elevation = 2.0, -60.0
+        wide.azimuth = float(np.degrees(np.arctan2(toward_robot[1], toward_robot[0])))
         old_wide, _, _ = free.render(data, wide, mujoco.MjvOption())
         new_wide, wide_kinds, wide_ids = free.render(data, wide, SU.progress_scene_option())
         free.close()

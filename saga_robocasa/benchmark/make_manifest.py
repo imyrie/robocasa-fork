@@ -26,8 +26,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmark.episodes import (BENCHMARK_VERSION, CHECKS, RANGES, BenchmarkEpisode, EpisodeParams,  # noqa: E402
                                 attempt_seed, camera_record, git_commit, host_info)
 from controlled_episode import DEFAULT_OBJECT_XML, TASK  # noqa: E402
+from nav_expert import footprint_blocked  # noqa: E402
 
 MANIFEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifests")
+
+
+def rejection_code(reason):
+    for prefix, code in (("object outside", "object_outside_region"), ("object moved", "object_settle_shift"),
+                         ("object tilted", "object_tilt"), ("object touches", "object_contact"),
+                         ("invalid IK", "goal_ik"), ("insufficient clearance at the goal", "goal_clearance"),
+                         ("contact at the goal", "goal_contact"), ("start footprint", "start_footprint"),
+                         ("immediate collision", "start_collision_risk"), ("navigation start disconnected", "start_disconnected")):
+        if reason.startswith(prefix):
+            return code
+    return "other"
 
 
 def success_thresholds(config, nav):
@@ -53,8 +65,9 @@ def main():
     parser.add_argument("--version", default=BENCHMARK_VERSION)
     parser.add_argument("--master-seed", type=int, default=20261018)
     parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--max-attempts", type=int, default=50)
+    parser.add_argument("--max-attempts", type=int, default=5000)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--abort-report-dir", default="/common/users/im484/saga_benchmark/manifest_generation")
     args = parser.parse_args()
     if args.version != BENCHMARK_VERSION:
         raise SystemExit(f"episodes.py implements {BENCHMARK_VERSION}; a new version needs its own definition")
@@ -70,44 +83,95 @@ def main():
     raw_env = bench.raw_env
     config, nav = bench.config, bench.nav_config
     thresholds = success_thresholds(config, nav)
-    entries, rejected = [], []
+    entries, rejected, counts = [], [], {"precheck_candidates": 0, "precheck_survivors": 0, "full_checks": 0}
+    by_episode = {}
+    early = None
     started = time.time()
+    abort_dir = args.abort_report_dir
+    default = lambda o: o.tolist() if isinstance(o, np.ndarray) else (o if isinstance(o, (str, int, bool)) else float(o))
+
+    def abort(reason):
+        os.makedirs(abort_dir, exist_ok=True)
+        path = os.path.join(abort_dir, f"{args.version}_generation_ABORTED.json")
+        with open(path, "w") as file:
+            json.dump({"aborted": reason, "code_commit": commit, "accepted": len(entries), "counts": counts,
+                       "early_check": early, "rejections_by_episode": by_episode, "rejections": rejected,
+                       "accepted_entries": [{k: e[k] for k in ("episode_id", "attempt", "perturbation_seed", "params")} for e in entries],
+                       "wall_time_s": time.time() - started}, file, indent=1, default=default)
+        raise SystemExit(f"ABORT: {reason} (partial report {path}; no manifest written)")
+
     for index in range(args.episodes):
+        episode_counts = by_episode.setdefault(index, {})
         for attempt in range(args.max_attempts):
             seed = attempt_seed(args.master_seed, index, attempt)
             params = EpisodeParams.sample(np.random.default_rng(seed))
-            _, nav_plan, report = bench.reset_to_spec(params, validate=True)
-            if report["rejection"] is not None:
-                rejected.append({"index": index, "attempt": attempt, "perturbation_seed": seed,
-                                 "params": params.__dict__, "reason": report["rejection"]})
-                print(f"episode {index:3d} attempt {attempt}: REJECT {report['rejection']}")
-                continue
-            split = "train" if index < args.episodes // 2 else "heldout"
-            entries.append({
-                "benchmark_version": args.version, "split": split, "episode_id": f"episode_{index:03d}",
-                "index": index, "master_seed": args.master_seed, "attempt": attempt, "perturbation_seed": seed,
-                "task": TASK, "robot": "SpotWithArmFloating", "controlled_episode_seed": config.seed,
-                "layout_style": [int(raw_env.layout_id), int(raw_env.style_id)], "target_object_xml": DEFAULT_OBJECT_XML,
-                "params": params.__dict__,
-                "object": {"commanded_position": report["object_commanded_position"],
-                           "position": report["object_position"], "quat_wxyz": report["object_quat_wxyz"]},
-                "initial_base": {"xy": report["start_xy"], "yaw": report["start_yaw"]},
-                "pregrasp": {"xy": report["goal_xy"], "yaw": report["goal_yaw"]},
-                "navigation_path_waypoints": len(nav_plan["path"]),
-                "camera": camera_record()["id"], "control_freq_hz": float(raw_env.control_freq),
-                "initial_state_sha256": report["initial_state_sha256"],
-                "checks": report["checks"],
-            })
-            print(f"episode {index:3d} attempt {attempt}: ACCEPT {split} start {report['start_xy']} "
-                  f"({nav_plan['distance']:.2f} m) object dxy ({params.object_dx:+.3f}, {params.object_dy:+.3f}) "
-                  f"dyaw {params.object_dyaw:+.2f}", flush=True)
-            break
+            # Cheap geometric pre-check (fixtures are static): the start footprint test of
+            # reset_to_spec(validate=True), evaluated at the goal implied by the commanded object pose.
+            # It only rejects candidates whose start lies in a fixture or outside the room; every
+            # survivor still runs the full checks. It never looks at the index/split or at outcomes.
+            counts["precheck_candidates"] += 1
+            goal_xy, goal_yaw = bench.goal_for_object(bench.reference["object_xy"] + np.array([params.object_dx, params.object_dy]))
+            start_xy, _ = bench.start_pose_for_goal(goal_xy, goal_yaw, params)
+            if footprint_blocked(bench.raw_env, start_xy, nav.transit_clearance):
+                code = "start_footprint_precheck"
+                rejected.append([index, attempt, seed, code])
+                episode_counts[code] = episode_counts.get(code, 0) + 1
+            else:
+                counts["precheck_survivors"] += 1
+                counts["full_checks"] += 1
+                _, nav_plan, report = bench.reset_to_spec(params, validate=True)
+                if report["rejection"] is None:
+                    break
+                code = rejection_code(report["rejection"])
+                rejected.append([index, attempt, seed, code, report["rejection"][:300]])
+                episode_counts[code] = episode_counts.get(code, 0) + 1
+                print(f"episode {index:3d} attempt {attempt}: REJECT {report['rejection'][:160]}", flush=True)
+            if (attempt + 1) % 250 == 0:
+                print(f"episode {index:3d}: {attempt + 1} attempts, {counts['precheck_survivors']}/{counts['precheck_candidates']} "
+                      f"candidates survived the pre-check so far, {time.time() - started:.0f} s", flush=True)
+            if len(entries) < 5 and time.time() - started > 1800:
+                abort(f"first five entries not produced within 30 min ({len(entries)} accepted)")
+            if (len(entries) < 5 and counts["precheck_candidates"] >= 1000
+                    and counts["precheck_survivors"] < 0.01 * counts["precheck_candidates"]):
+                abort(f"fewer than 1% of candidates survive the geometric pre-check "
+                      f"({counts['precheck_survivors']}/{counts['precheck_candidates']})")
         else:
-            raise SystemExit(f"episode {index}: no valid initial condition in {args.max_attempts} attempts")
+            abort(f"episode {index}: no valid initial condition in {args.max_attempts} attempts")
+        split = "train" if index < args.episodes // 2 else "heldout"
+        entries.append({
+            "benchmark_version": args.version, "split": split, "episode_id": f"episode_{index:03d}",
+            "index": index, "master_seed": args.master_seed, "attempt": attempt, "perturbation_seed": seed,
+            "task": TASK, "robot": "SpotWithArmFloating", "controlled_episode_seed": config.seed,
+            "layout_style": [int(raw_env.layout_id), int(raw_env.style_id)], "target_object_xml": DEFAULT_OBJECT_XML,
+            "params": params.__dict__,
+            "object": {"commanded_position": report["object_commanded_position"],
+                       "position": report["object_position"], "quat_wxyz": report["object_quat_wxyz"]},
+            "initial_base": {"xy": report["start_xy"], "yaw": report["start_yaw"]},
+            "pregrasp": {"xy": report["goal_xy"], "yaw": report["goal_yaw"]},
+            "navigation_path_waypoints": len(nav_plan["path"]),
+            "camera": camera_record()["id"], "control_freq_hz": float(raw_env.control_freq),
+            "initial_state_sha256": report["initial_state_sha256"],
+            "checks": report["checks"],
+        })
+        print(f"episode {index:3d} ACCEPT {split} after {attempt + 1} attempts | start {nav_plan['distance']:.2f} m, bearing "
+              f"{params.start_bearing:+.2f}, yaw offset {params.start_yaw_offset:+.2f} | object dxy ({params.object_dx:+.3f}, "
+              f"{params.object_dy:+.3f}) dyaw {params.object_dyaw:+.2f} | {time.time() - started:.0f} s", flush=True)
+        if len(entries) == 5:
+            early = {"elapsed_s": time.time() - started, "candidates": counts["precheck_candidates"],
+                     "precheck_survivors": counts["precheck_survivors"], "full_checks": counts["full_checks"],
+                     "precheck_survival_rate": counts["precheck_survivors"] / counts["precheck_candidates"],
+                     "attempts_per_entry": [e["attempt"] + 1 for e in entries]}
+            print(f"EARLY CHECK: first five entries in {early['elapsed_s']:.0f} s, {early['candidates']} candidates, "
+                  f"pre-check survival {100 * early['precheck_survival_rate']:.1f}%, attempts per entry "
+                  f"{early['attempts_per_entry']}", flush=True)
+            if early["elapsed_s"] > 1800:
+                abort("first five entries took more than 30 min")
+            if early["precheck_survival_rate"] < 0.01:
+                abort("fewer than 1% of candidates survive the geometric pre-check")
 
     ids = [e["episode_id"] for e in entries]
     seeds = [e["perturbation_seed"] for e in entries]
-    all_seeds = seeds + [r["perturbation_seed"] for r in rejected]
+    all_seeds = seeds + [r[2] for r in rejected]
     train = {e["perturbation_seed"] for e in entries if e["split"] == "train"}
     heldout = {e["perturbation_seed"] for e in entries if e["split"] == "heldout"}
     assert len(set(ids)) == len(ids) == args.episodes
@@ -132,18 +196,21 @@ def main():
         "success_thresholds": thresholds,
         "episodes": entries,
     }
+    by_reason = {}
+    for row in rejected:
+        by_reason[row[3]] = by_reason.get(row[3], 0) + 1
     generation = {"benchmark_version": args.version, "code_commit": commit, "code_dirty": dirty,
-                  "master_seed": args.master_seed, "accepted": len(entries), "rejected": len(rejected),
-                  "rejections_by_reason": {}, "rejections": rejected, "wall_time_s": time.time() - started}
-    for r in rejected:
-        key = r["reason"].split(" (")[0].split(" [")[0]
-        generation["rejections_by_reason"][key] = generation["rejections_by_reason"].get(key, 0) + 1
+                  "master_seed": args.master_seed, "generated_on": host_info(), "accepted": len(entries),
+                  "rejected": len(rejected), "counts": counts, "early_check": early, "rejections_by_reason": by_reason,
+                  "rejections_by_episode": by_episode,
+                  "rejections_format": "[episode index, attempt, candidate seed, reason code(, full reason for full-check rejections)]",
+                  "rejections": rejected, "wall_time_s": time.time() - started}
     os.makedirs(os.path.dirname(output), exist_ok=True)
-    default = lambda o: o.tolist() if isinstance(o, np.ndarray) else (o if isinstance(o, (str, int, bool)) else float(o))
     with open(output, "w") as file:
         json.dump(manifest, file, indent=1, default=default)
     with open(summary_path, "w") as file:
-        json.dump(generation, file, indent=1, default=default)
+        file.write(json.dumps({k: v for k, v in generation.items() if k != "rejections"}, indent=1, default=default)[:-2])
+        file.write(',\n "rejections": [\n' + ",\n".join("  " + json.dumps(row, default=default) for row in rejected) + "\n ]\n}\n")
     print(f"wrote {output} ({len(entries)} episodes) and {summary_path} ({len(rejected)} rejected attempts) "
           f"in {time.time() - started:.0f} s")
     bench.episode.close()

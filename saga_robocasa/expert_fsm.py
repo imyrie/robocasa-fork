@@ -85,6 +85,19 @@ class ExpertConfig:
     clearance_every: int = 5
     settle_min_steps: int = 50
     settle_max_steps: int = 150
+    # STABILITY_HOLD rule. "ptp" (original, default): >= 10 recorded steps and peak-to-peak translation
+    # slip over the last 10 < 5e-4 m within 40 steps. "convergence" (expert v2): per-step change of
+    # translation slip <= stability_max_step_slip AND of rotation slip <= stability_max_step_rotation,
+    # with both jaws on the object and the object height within stability_height_tolerance of its
+    # height at the start of the hold, for stability_consecutive consecutive steps, within
+    # stability_timeout steps; otherwise fail as grasp_stability_timeout. Total-slip limits
+    # (max_slip_position / max_slip_rotation) are enforced by the monitors as before.
+    stability_rule: str = "ptp"
+    stability_max_step_slip: float = 0.0005
+    stability_max_step_rotation: float = 0.005
+    stability_consecutive: int = 8
+    stability_timeout: int = 100
+    stability_height_tolerance: float = 0.01
     # Reproducible initial-condition perturbations (-1 = none): uniform in +/- the given ranges.
     perturb_seed: int = -1
     object_xy_noise: float = 0.02
@@ -455,8 +468,11 @@ class ExpertFSM:
             stable.append(self.monitor.get("slip_position", 0.0))
             return len(stable) >= 10 and np.ptp(stable[-10:]) < 5e-4
 
-        yield from self._hold_until("STABILITY_HOLD", SU.CLOSE_GRIPPER, grasp_stable, 10, 40,
-                                    lambda: "slip still changing")
+        if config.stability_rule == "convergence":
+            yield from self._stability_hold_convergence()
+        else:
+            yield from self._hold_until("STABILITY_HOLD", SU.CLOSE_GRIPPER, grasp_stable, 10, 40,
+                                        lambda: "slip still changing")
         yield from self._move("RETRACT", plan["retract_tcp"], rotation, config.slow_speed, SU.CLOSE_GRIPPER)
         yield from self._move("TRANSIT", plan["transit_tcp"], plan["release_rotation"], config.transit_speed, SU.CLOSE_GRIPPER)
         yield from self._move("RELEASE_DESCEND", plan["release_tcp"], plan["release_rotation"], config.slow_speed,
@@ -493,6 +509,36 @@ class ExpertFSM:
 
         yield from self._hold_until("FINAL_HOLD", SU.OPEN_GRIPPER, finished, 10, 30,
                                     lambda: "_check_success() is False or gripper too close")
+
+    def _stability_hold_convergence(self):
+        """STABILITY_HOLD with an explicit convergence criterion (ExpertConfig.stability_rule == "convergence")."""
+        config = self.config
+        site, rotation = SU.grip_site_pose(self.raw_env)
+        body = self.raw_env.obj_body_id["obj"]
+        start_height = float(self.data.xpos[body][2])
+        previous, streak, log = None, 0, []
+        for index in range(config.stability_timeout):
+            yield Command("STABILITY_HOLD", site, rotation, SU.CLOSE_GRIPPER, index)
+            slip = (self.monitor.get("slip_position", 0.0), self.monitor.get("slip_rotation", 0.0))
+            contacts = self.monitor["contacts"]
+            height_ok = abs(float(self.data.xpos[body][2]) - start_height) <= config.stability_height_tolerance
+            jaws = bool(contacts["fixed_jaw"]) and bool(contacts["moving_jaw"])
+            if previous is None:
+                ok = False
+            else:
+                ok = (abs(slip[0] - previous[0]) <= config.stability_max_step_slip
+                      and abs(slip[1] - previous[1]) <= config.stability_max_step_rotation and jaws and height_ok)
+            streak = streak + 1 if ok else 0
+            log.append((slip[0], slip[1]))
+            previous = slip
+            if streak >= config.stability_consecutive:
+                self.events.append(("STABILITY_HOLD", {"steps": index + 1, "rule": "convergence", "slip_position": slip[0],
+                                                       "slip_rotation": slip[1]}))
+                return
+        deltas = np.abs(np.diff(np.array(log), axis=0)) if len(log) > 1 else np.zeros((1, 2))
+        raise ExpertAbort("STABILITY_HOLD", f"grasp_stability_timeout: no {config.stability_consecutive} consecutive "
+                                            f"converged steps in {config.stability_timeout} (max step change "
+                                            f"{deltas[:, 0].max():.5f} m / {deltas[:, 1].max():.5f} rad)")
 
     # ---------------------------------------------------------------- planning
 

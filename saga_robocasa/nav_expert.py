@@ -71,6 +71,17 @@ class NavConfig:
     settle_timeout: int = 100
     min_base_clearance_nav: float = 0.04
     min_arm_clearance_nav: float = 0.03
+    # Footprint-aware base motion (expert v2; off by default so earlier demonstrations keep their
+    # exact behaviour). Every NAV_FOLLOW / NAV_ALIGN command is checked by forward-predicting the
+    # robot's real collision geometry (rectangular base with legs, arm, gripper) along the commanded
+    # motion; the abort thresholds above are unchanged.
+    footprint_avoidance: bool = False
+    avoid_horizon_steps: int = 10       # look-ahead (0.5 s), checked at several sub-steps
+    avoid_buffer: float = 0.04          # required predicted margin above each part's abort threshold
+    avoid_trigger: float = 0.30         # only search alternatives when the current margin is below this
+    rotate_first_yaw: float = 0.35      # |yaw error| above which translation is reduced while turning
+    rotate_first_translation_scale: float = 0.25
+    avoid_stall_steps: int = 150        # abort if no safe progressing command for this many steps
 
 
 @dataclass
@@ -237,6 +248,89 @@ def prepare_navigation_start(episode, config, nav_config):
 # --------------------------------------------------------------------------- expert
 
 
+class FootprintPredictor:
+    """
+    Kinematic look-ahead of the robot's collision geometry for a candidate base velocity.
+
+    The base pose is moved on a scratch MjData (yaw joint, then the two slide joints solved so the
+    base centre site lands on the predicted position); arm joints keep their current values (the
+    arm holds its pose relative to the base during navigation). The margin of a pose is the
+    minimum over robot parts (base incl. legs, arm, gripper) of exact narrow-phase distance to the
+    scene minus that part's navigation abort threshold. Planning only: never touches the live sim.
+    """
+
+    def __init__(self, raw_env, exclude, thresholds):
+        import mujoco
+
+        self.mujoco = mujoco
+        self.raw_env = raw_env
+        self.model = raw_env.sim.model._model
+        self.scratch = mujoco.MjData(self.model)
+        self.thresholds = thresholds
+        self.joint = {s: self.model.joint(SU.EnvUtils.get_mobile_base_joint_name(raw_env, s)).id
+                      for s in ("forward", "side", "yaw")}
+        self.qadr = {s: self.model.jnt_qposadr[j] for s, j in self.joint.items()}
+        self.site = self.model.site(raw_env.robots[0].robot_model.base.correct_naming("center")).id
+        self.robot = {"base": [], "arm": [], "gripper": []}
+        self.scene = []
+        for g in SU.collidable(self.model):
+            owner = SU.geom_owner(self.model, g)
+            if owner is not None:
+                self.robot[owner].append(g)
+            elif g not in exclude and "floor" not in SU.geom_name(self.model, g).lower():
+                self.scene.append(g)
+        self.fromto = np.zeros(6)
+
+    def set_pose(self, qpos, xy, yaw):
+        mujoco, scratch = self.mujoco, self.scratch
+        scratch.qpos[:] = qpos
+        mujoco.mj_kinematics(self.model, scratch)
+        current_yaw = float(np.arctan2(scratch.site_xmat[self.site][3], scratch.site_xmat[self.site][0]))
+        scratch.qpos[self.qadr["yaw"]] += float(np.angle(np.exp(1j * (yaw - current_yaw))))
+        for _ in range(2):
+            mujoco.mj_kinematics(self.model, scratch)
+            error = np.asarray(xy) - scratch.site_xpos[self.site][:2]
+            axes = np.stack([scratch.xaxis[self.joint["forward"]][:2], scratch.xaxis[self.joint["side"]][:2]], axis=1)
+            delta = np.linalg.solve(axes, error)
+            scratch.qpos[self.qadr["forward"]] += delta[0]
+            scratch.qpos[self.qadr["side"]] += delta[1]
+        mujoco.mj_kinematics(self.model, scratch)
+
+    def margin(self, radius=1.6, cap=0.5):
+        scratch, model = self.scratch, self.model
+        centre = scratch.site_xpos[self.site][:2]
+        nearby = [g for g in self.scene if np.linalg.norm(scratch.geom_xpos[g][:2] - centre) - model.geom_rbound[g] <= radius]
+        worst, detail = np.inf, None
+        for part, geoms in self.robot.items():
+            for robot_geom in geoms:
+                for scene_geom in nearby:
+                    if (np.linalg.norm(scratch.geom_xpos[robot_geom] - scratch.geom_xpos[scene_geom])
+                            - model.geom_rbound[robot_geom] - model.geom_rbound[scene_geom] > cap):
+                        continue
+                    d = self.mujoco.mj_geomDistance(model, scratch, robot_geom, scene_geom, cap, self.fromto)
+                    if d - self.thresholds[part] < worst:
+                        worst, detail = d - self.thresholds[part], (part, SU.geom_name(model, scene_geom))
+        return (cap if worst == np.inf else float(worst)), detail
+
+    def sweep_margin(self, qpos, xy, yaw, velocity, steps, dt, samples=(2, 5, 10)):
+        """Minimum margin along constant base-frame velocity [vx, vy, wz] over `steps` control steps."""
+        worst, detail, position, heading = np.inf, None, np.asarray(xy, dtype=float).copy(), float(yaw)
+        poses = {}
+        for k in range(1, steps + 1):
+            c, s = np.cos(heading), np.sin(heading)
+            position = position + dt * np.array([c * velocity[0] - s * velocity[1], s * velocity[0] + c * velocity[1]])
+            heading += dt * velocity[2]
+            poses[k] = (position.copy(), heading)
+        for k in samples:
+            if k > steps:
+                continue
+            self.set_pose(qpos, *poses[k])
+            margin, where = self.margin()
+            if margin < worst:
+                worst, detail = margin, where
+        return worst, detail, poses[steps]
+
+
 class NavExpertFSM(ExpertFSM):
     phases = PHASES
 
@@ -250,6 +344,13 @@ class NavExpertFSM(ExpertFSM):
         site, rotation = SU.grip_site_pose(self.raw_env)
         base_rotation = self._yaw_matrix(base_yaw)
         self.arm_relative = (base_rotation.T @ (site - base_position), base_rotation.T @ rotation)
+        self.predictor = None
+        self.avoid_stats = {"steps_checked": 0, "steps_modified": 0, "min_predicted_margin": np.inf, "stalled_steps": 0}
+        self._target = None
+        if nav_config is not None and nav_config.footprint_avoidance:
+            thresholds = {"base": nav_config.min_base_clearance_nav, "arm": nav_config.min_arm_clearance_nav,
+                          "gripper": config.min_gripper_clearance}
+            self.predictor = FootprintPredictor(self.raw_env, self.object_geoms, thresholds)
 
     @staticmethod
     def _yaw_matrix(yaw):
@@ -300,8 +401,75 @@ class NavExpertFSM(ExpertFSM):
         return np.array([velocity[0], velocity[1], yaw_rate]), np.linalg.norm(error_world), abs(yaw_error)
 
     def _nav_command(self, phase, index, velocity):
+        if self.predictor is not None and phase in ("NAV_FOLLOW", "NAV_ALIGN") and self._target is not None:
+            velocity = self._safe_velocity(np.asarray(velocity, dtype=float))
         site, rotation = self._arm_target()
         return NavCommand(phase, site, rotation, SU.OPEN_GRIPPER, index, base_velocity=velocity)
+
+    def _safe_velocity(self, nominal):
+        """
+        Collision-aware base command for the rectangular Spot footprint. Accept the nominal command if
+        the predicted margin over the look-ahead stays >= avoid_buffer; otherwise choose, among
+        deterministic alternatives (reduced translation, translation rotated away by up to 1.2 rad,
+        rotation only, translation only, stop), the one with the most progress towards the target whose
+        predicted margin stays >= avoid_buffer (or, when already inside the buffer, does not decrease).
+        """
+        nav, predictor = self.nav_config, self.predictor
+        qpos = self.data.qpos.copy()
+        base_position, base_yaw = SU.base_pose(self.raw_env)
+        xy = base_position[:2].copy()
+        dt = 1.0 / float(self.raw_env.control_freq)
+        steps = nav.avoid_horizon_steps
+        predictor.set_pose(qpos, xy, base_yaw)
+        current, _ = predictor.margin()
+        self.avoid_stats["steps_checked"] += 1
+        if current >= nav.avoid_trigger:
+            self.avoid_stats["stalled_steps"] = 0
+            return nominal
+        target_xy, target_yaw = self._target
+
+        def progress(end):
+            (end_xy, end_yaw) = end
+            yaw0 = abs(np.angle(np.exp(1j * (target_yaw - base_yaw))))
+            yaw1 = abs(np.angle(np.exp(1j * (target_yaw - end_yaw))))
+            return (np.linalg.norm(target_xy - xy) - np.linalg.norm(target_xy - end_xy)) + 0.2 * (yaw0 - yaw1)
+
+        def evaluate(v):
+            margin, where, end = predictor.sweep_margin(qpos, xy, base_yaw, v, steps, dt)
+            return margin, where, progress(end)
+
+        margin, where, gain = evaluate(nominal)
+        self.avoid_stats["min_predicted_margin"] = min(self.avoid_stats["min_predicted_margin"], margin)
+        required = nav.avoid_buffer if current >= nav.avoid_buffer else current
+        if margin >= required:
+            self.avoid_stats["stalled_steps"] = 0
+            return nominal
+        candidates = []
+        translation, yaw_rate = nominal[:2], nominal[2]
+        for scale in (1.0, 0.5):
+            for angle in (0.0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2):
+                c, s = np.cos(angle), np.sin(angle)
+                moved = scale * np.array([c * translation[0] - s * translation[1], s * translation[0] + c * translation[1]])
+                for w in (yaw_rate, 0.0):
+                    candidates.append(np.array([moved[0], moved[1], w]))
+        candidates += [np.array([0.0, 0.0, yaw_rate]), np.zeros(3)]
+        best, best_gain, best_margin = None, -np.inf, -np.inf
+        fallback, fallback_margin = np.zeros(3), -np.inf
+        for v in candidates:
+            m, _, g = evaluate(v)
+            if m > fallback_margin:
+                fallback, fallback_margin = v, m
+            if m >= required and g > best_gain + 1e-9:
+                best, best_gain, best_margin = v, g, m
+        self.avoid_stats["steps_modified"] += 1
+        if best is None or best_gain <= 1e-4:
+            self.avoid_stats["stalled_steps"] += 1
+            if self.avoid_stats["stalled_steps"] > nav.avoid_stall_steps:
+                raise ExpertAbort("NAV_FOLLOW", f"footprint-aware controller found no safe progressing command "
+                                                f"(margin {current:.3f} m near {where})")
+            return fallback if best is None else best
+        self.avoid_stats["stalled_steps"] = 0
+        return best
 
     def navigation(self):
         nav, goal_xy, goal_yaw = self.nav_config, self.start["base_xy"], self.start["base_yaw"]
@@ -317,7 +485,15 @@ class NavExpertFSM(ExpertFSM):
                 np.linalg.norm(b - a) for a, b in zip(path[travelled_index:-1], path[travelled_index + 1:]))
             progress = 1.0 - min(1.0, remaining / max(total, 1e-6))
             desired_yaw = start_yaw + progress * float(np.angle(np.exp(1j * (goal_yaw - start_yaw))))
-            velocity, distance, _ = self._base_command(waypoint, desired_yaw, final=False)
+            if self.predictor is not None:
+                # Rotate-first: turn to the goal yaw early and hold translation low while the heading
+                # error is large (the swept footprint of each command is checked in _nav_command).
+                desired_yaw = goal_yaw
+            velocity, distance, yaw_error = self._base_command(waypoint, desired_yaw, final=False)
+            if self.predictor is not None and yaw_error > nav.rotate_first_yaw:
+                velocity = np.array([velocity[0] * nav.rotate_first_translation_scale,
+                                     velocity[1] * nav.rotate_first_translation_scale, velocity[2]])
+            self._target = (np.asarray(waypoint, dtype=float), float(goal_yaw))
             yield self._nav_command("NAV_FOLLOW", index, velocity)
             base_position, _ = SU.base_pose(self.raw_env)
             if np.linalg.norm(waypoint - base_position[:2]) <= nav.waypoint_tolerance:
@@ -330,6 +506,7 @@ class NavExpertFSM(ExpertFSM):
 
         for index in range(nav.align_timeout):
             velocity, distance, yaw_error = self._base_command(goal_xy, goal_yaw, final=True)
+            self._target = (np.asarray(goal_xy, dtype=float), float(goal_yaw))
             yield self._nav_command("NAV_ALIGN", index, velocity)
             _, distance, yaw_error = self._base_command(goal_xy, goal_yaw, final=True)
             if distance <= nav.nav_position_tolerance and yaw_error <= nav.nav_yaw_tolerance:
@@ -347,6 +524,8 @@ class NavExpertFSM(ExpertFSM):
                 if distance > nav.nav_position_tolerance or yaw_error > nav.nav_yaw_tolerance:
                     raise ExpertAbort("NAV_SETTLE", f"base settled outside tolerance ({distance:.4f} m, {yaw_error:.4f} rad)")
                 self.events.append(("NAV_SETTLE", {"steps": index + 1, "position_error": distance, "yaw_error": yaw_error}))
+                if self.predictor is not None:
+                    self.events.append(("NAV_FOOTPRINT", dict(self.avoid_stats)))
                 return
         raise ExpertAbort("NAV_SETTLE", "base did not settle")
 

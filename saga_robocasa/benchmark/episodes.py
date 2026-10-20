@@ -39,6 +39,14 @@ from expert_fsm import TOP_DOWN, ExpertConfig, manipulation_start, prepare_start
 from nav_expert import GridPlanner, NavConfig, footprint_blocked
 
 BENCHMARK_VERSION = "counter_to_sink_v1"
+# Expert used for the benchmark audit and collection. v2 = footprint-aware navigation (rectangular
+# base/arm/gripper look-ahead, rotate-first) + convergence-based STABILITY_HOLD. Same abort thresholds,
+# success definition and manifest as v1. Resets (initial states) do not depend on these settings.
+EXPERT_VERSION = "expert_v2"
+
+
+def benchmark_expert_configs():
+    return (ExpertConfig(stability_rule="convergence"), NavConfig(footprint_avoidance=True))
 CAMERA_ID = "saga_external_v1"
 RANGES = {
     "start_distance_m": [1.4, 2.4],
@@ -127,8 +135,9 @@ class BenchmarkEpisode:
     """Wraps a ControlledEpisode; computes the reference (unperturbed) goal once."""
 
     def __init__(self, episode=None, config=None, nav_config=None):
-        self.config = config or ExpertConfig()
-        self.nav_config = nav_config or NavConfig()
+        default_config, default_nav = benchmark_expert_configs()
+        self.config = config or default_config
+        self.nav_config = nav_config or default_nav
         self.episode = episode or ControlledEpisode(self.config.seed, DEFAULT_OBJECT_XML, policy_camera=True)
         reference = prepare_start(self.episode, self.config)  # unperturbed seed-0 start (unchanged code path)
         raw_env = self.episode.raw_env

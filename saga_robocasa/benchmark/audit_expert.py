@@ -20,7 +20,9 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from benchmark.episodes import BenchmarkEpisode, host_info, params_from_entry  # noqa: E402
+import dataclasses  # noqa: E402
+import spot_utils as SU  # noqa: E402
+from benchmark.episodes import EXPERT_VERSION, BenchmarkEpisode, git_commit, host_info, params_from_entry  # noqa: E402
 from expert_fsm import CARRY, ExpertAbort  # noqa: E402
 from nav_expert import NAV_PHASES, NavExpertFSM  # noqa: E402
 from robocasa.utils import object_utils as OU  # noqa: E402
@@ -28,15 +30,21 @@ from robocasa.utils import object_utils as OU  # noqa: E402
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifests", "counter_to_sink_v1.json")
 
 
+EXPERT_COMMIT = None
+
+
 def failure_category(failure):
     if failure is None:
         return None
     phase, reason = failure["phase"], failure["reason"]
     if phase in NAV_PHASES or phase == "NAV_PLAN":
-        return "navigation"
+        return "navigation_collision" if "unsafe" in reason else "navigation"
     if "missed grasp" in reason:
         return "missed_grasp"
-    if "drop" in reason or "slip" in reason:
+    # A hold phase that times out while the grasp is intact is not a drop.
+    if "grasp_stability_timeout" in reason or (phase in ("GRASP_HOLD", "STABILITY_HOLD") and "timeout" in reason):
+        return "grasp_stability_timeout"
+    if "object drop" in reason or "lost jaw contact" in reason:
         return "drop"
     if "joint-limit" in reason:
         return "joint_limit"
@@ -51,7 +59,7 @@ def failure_category(failure):
     return "other"
 
 
-def audit(bench, entry):
+def audit(bench, entry, video_dir=None):
     params = params_from_entry(entry)
     start, nav_plan, report = bench.reset_to_spec(params)
     raw_env, episode = bench.raw_env, bench.episode
@@ -59,6 +67,11 @@ def audit(bench, entry):
     body = raw_env.obj_body_id["obj"]
     hash_match = report["initial_state_sha256"] == entry["initial_state_sha256"]
     fsm = NavExpertFSM(episode, bench.config, start, bench.nav_config, nav_plan)
+    progress = None
+    if video_dir is not None:
+        look = 0.5 * (np.asarray(nav_plan["xy"].tolist() + [0.0]) + start["object_origin"]) + np.array([0.0, 0.0, 0.3])
+        progress = SU.FrameRecorder(raw_env, os.path.join(video_dir, entry["episode_id"] + "_frames"), look_at=look,
+                                    azimuth_deg=np.degrees(start["base_yaw"]) + 120.0, elevation_deg=-45.0, distance=3.2)
     initial_z = float(data.xpos[body][2])
     stats = {"min_clearance": {"navigation": {"base": np.inf, "arm": np.inf, "gripper": np.inf},
                                "manipulation": {"base": np.inf, "arm": np.inf, "gripper": np.inf}},
@@ -69,6 +82,8 @@ def audit(bench, entry):
     try:
         for command in fsm.commands():
             episode.env.step(fsm.action(command))
+            if progress is not None:
+                progress.capture()
             fsm.observe(command)
             steps += 1
             monitor = fsm.monitor
@@ -91,6 +106,10 @@ def audit(bench, entry):
             failure = {"phase": "FINAL", "reason": "_check_success() False after FSM completed"}
     except ExpertAbort as error:
         failure = {"phase": error.phase, "reason": error.reason}
+    if progress is not None:
+        progress.capture()
+        progress.write_video(os.path.join(video_dir, entry["episode_id"] + ".mp4"))
+        progress.close()
     completed = {phase for phase, _ in fsm.events}
     inside = [info.get("partial") for phase, info in fsm.events if phase == "INSIDE_SINK_AFTER_SETTLE"]
     stages = {
@@ -106,6 +125,8 @@ def audit(bench, entry):
         "episode_id": entry["episode_id"], "split": entry["split"], "initial_state_hash_match": hash_match,
         "success": success, "stages": stages, "failure": failure, "failure_category": failure_category(failure),
         "steps": steps, "wall_time_s": time.time() - started, **host_info(),
+        "expert_version": EXPERT_VERSION, "expert_commit": EXPERT_COMMIT,
+        "expert_config": dataclasses.asdict(bench.config), "nav_config": dataclasses.asdict(bench.nav_config),
         "start_distance_m": nav_plan["distance"], "path_waypoints": len(nav_plan["path"]),
         "navigation_final": nav_events.get("NAV_SETTLE"),
         "final_object_in_sink_partial": bool(OU.obj_inside_of(raw_env, "obj", raw_env.sink, partial_check=True)),
@@ -119,18 +140,24 @@ def main():
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST)
     parser.add_argument("--episodes", type=int, nargs="*", default=None, help="manifest indices (default: all)")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--video-dir", default=None, help="also save a free-camera diagnostic video per episode")
     args = parser.parse_args()
     manifest = json.load(open(args.manifest))
     entries = manifest["episodes"] if args.episodes is None else [manifest["episodes"][i] for i in args.episodes]
     os.makedirs(args.output, exist_ok=True)
     setup = time.time()
+    global EXPERT_COMMIT
+    commit, dirty = git_commit()
+    EXPERT_COMMIT = {"commit": commit, "dirty": dirty}
+    if dirty:
+        print("WARNING: tracked files have uncommitted changes (expert_commit.dirty = true)")
     bench = BenchmarkEpisode()
     print(f"environment setup {time.time() - setup:.1f} s", flush=True)
     if not np.allclose(bench.goal_offset, manifest["reference"]["goal_offset_in_goal_frame"], atol=1e-9):
         raise SystemExit("reference goal offset differs from the manifest")
     default = lambda o: o.tolist() if isinstance(o, np.ndarray) else (o if isinstance(o, (str, int, bool)) else float(o))
     for entry in entries:
-        result = audit(bench, entry)
+        result = audit(bench, entry, args.video_dir)
         with open(os.path.join(args.output, f"{entry['episode_id']}.json"), "w") as file:
             json.dump(result, file, indent=1, default=default)
         s = result["stages"]

@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import dataclasses  # noqa: E402
 import spot_utils as SU  # noqa: E402
-from benchmark.episodes import EXPERT_VERSION, BenchmarkEpisode, git_commit, host_info, params_from_entry  # noqa: E402
+from benchmark.episodes import EXPERT_STATUS, EXPERT_VERSION, BenchmarkEpisode, git_commit, host_info, params_from_entry  # noqa: E402
 from expert_fsm import CARRY, ExpertAbort  # noqa: E402
 from nav_expert import NAV_PHASES, NavExpertFSM  # noqa: E402
 from robocasa.utils import object_utils as OU  # noqa: E402
@@ -59,20 +59,60 @@ def failure_category(failure):
     return "other"
 
 
-def audit(bench, entry, video_dir=None):
+class OverheadVideo:
+    """Overhead diagnostic video (collision geoms and sites hidden) with a per-step text overlay."""
+
+    def __init__(self, raw_env, centre, extent, path):
+        import mujoco
+
+        self.mujoco, self.raw_env, self.path = mujoco, raw_env, path
+        model = raw_env.sim.model._model
+        model.vis.global_.offwidth = max(model.vis.global_.offwidth, 640)
+        model.vis.global_.offheight = max(model.vis.global_.offheight, 640)
+        self.renderer = mujoco.Renderer(model, height=640, width=640)
+        self.camera = mujoco.MjvCamera()
+        self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self.camera.lookat[:] = [centre[0], centre[1], 0.4]
+        self.camera.distance, self.camera.elevation, self.camera.azimuth = max(3.6, 1.6 * extent), -89.0, 90.0
+        self.option = SU.progress_scene_option()
+        self.frames = []
+
+    def capture(self, lines):
+        from PIL import Image, ImageDraw
+
+        self.renderer.update_scene(self.raw_env.sim.data._data, camera=self.camera, scene_option=self.option)
+        image = Image.fromarray(self.renderer.render())
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([0, 0, 640, 16 * len(lines) + 6], fill=(0, 0, 0))
+        for i, line in enumerate(lines):
+            draw.text((6, 3 + 16 * i), line, fill=(255, 255, 0))
+        self.frames.append(np.asarray(image))
+
+    def write(self):
+        import imageio.v2 as imageio
+
+        with imageio.get_writer(self.path, fps=20, codec="libx264", quality=7) as writer:
+            for frame in self.frames + [self.frames[-1]] * 40:
+                writer.append_data(frame)
+        self.renderer.close()
+
+
+def audit(bench, entry, video_dir=None, dense_clearance=False):
     params = params_from_entry(entry)
     start, nav_plan, report = bench.reset_to_spec(params)
     raw_env, episode = bench.raw_env, bench.episode
     data = raw_env.sim.data._data
     body = raw_env.obj_body_id["obj"]
     hash_match = report["initial_state_sha256"] == entry["initial_state_sha256"]
-    fsm = NavExpertFSM(episode, bench.config, start, bench.nav_config, nav_plan)
     progress = None
     if video_dir is not None:
-        look = 0.5 * (np.asarray(nav_plan["xy"].tolist() + [0.0]) + start["object_origin"]) + np.array([0.0, 0.0, 0.3])
-        progress = SU.FrameRecorder(raw_env, os.path.join(video_dir, entry["episode_id"] + "_frames"), look_at=look,
-                                    azimuth_deg=np.degrees(start["base_yaw"]) + 120.0, elevation_deg=-45.0, distance=3.2)
+        pts = np.array([nav_plan["xy"], np.asarray(start["base_xy"]), np.asarray(start["object_origin"][:2])])
+        progress = OverheadVideo(raw_env, pts.mean(axis=0), float(np.ptp(pts, axis=0).max()) + 1.0,
+                                 os.path.join(video_dir, entry["episode_id"] + ".mp4"))
     initial_z = float(data.xpos[body][2])
+    dense = {"steps": 0, "min": {"base": np.inf, "arm": np.inf, "gripper": np.inf}, "seconds": 0.0}
+    timing = {"env_step_seconds": 0.0, "expert_seconds": 0.0, "nav_steps": 0}
+    fsm = None
     stats = {"min_clearance": {"navigation": {"base": np.inf, "arm": np.inf, "gripper": np.inf},
                                "manipulation": {"base": np.inf, "arm": np.inf, "gripper": np.inf}},
              "min_joint_margin": np.inf, "max_slip_position": 0.0, "max_slip_rotation": 0.0,
@@ -80,10 +120,38 @@ def audit(bench, entry, video_dir=None):
     steps, failure, success = 0, None, False
     started = time.time()
     try:
-        for command in fsm.commands():
-            episode.env.step(fsm.action(command))
+        t_plan = time.time()
+        fsm = NavExpertFSM(episode, bench.config, start, bench.nav_config, nav_plan)
+        timing["fsm_init_seconds"] = time.time() - t_plan
+        commands = fsm.commands()
+        while True:
+            t0 = time.perf_counter()
+            try:
+                command = next(commands)
+            except StopIteration:
+                break
+            action = fsm.action(command)
+            t1 = time.perf_counter()
+            episode.env.step(action)
+            t2 = time.perf_counter()
+            timing["expert_seconds"] += t1 - t0
+            timing["env_step_seconds"] += t2 - t1
+            if command.phase in NAV_PHASES:
+                timing["nav_steps"] += 1
+                if dense_clearance:
+                    t3 = time.perf_counter()
+                    rep = SU.clearance_report(raw_env.sim.model._model, data, SU.base_pose(raw_env)[0], exclude=fsm.object_geoms)
+                    dense["seconds"] += time.perf_counter() - t3
+                    dense["steps"] += 1
+                    for g in ("base", "arm", "gripper"):
+                        if rep[g]["distance"] < dense["min"][g]:
+                            dense["min"][g] = rep[g]["distance"]
+                            dense.setdefault("nearest", {})[g] = rep[g]["scene_geom"]
             if progress is not None:
-                progress.capture()
+                info = command.info
+                progress.capture([f"{entry['episode_id']} step {steps + 1} {command.phase} {info.get('v3_mode', '')}",
+                                  f"predicted margin {info.get('v3_predicted_margin', float('nan')):+.3f} m  admissible {info.get('v3_admissible', '-')}",
+                                  f"dense min base clearance so far {dense['min']['base']:.3f} m (abort < 0.040)"])
             fsm.observe(command)
             steps += 1
             monitor = fsm.monitor
@@ -106,12 +174,11 @@ def audit(bench, entry, video_dir=None):
             failure = {"phase": "FINAL", "reason": "_check_success() False after FSM completed"}
     except ExpertAbort as error:
         failure = {"phase": error.phase, "reason": error.reason}
-    if progress is not None:
-        progress.capture()
-        progress.write_video(os.path.join(video_dir, entry["episode_id"] + ".mp4"))
-        progress.close()
-    completed = {phase for phase, _ in fsm.events}
-    inside = [info.get("partial") for phase, info in fsm.events if phase == "INSIDE_SINK_AFTER_SETTLE"]
+    if progress is not None and progress.frames:
+        progress.write()
+    events = fsm.events if fsm is not None else []
+    completed = {phase for phase, _ in events}
+    inside = [info.get("partial") for phase, info in events if phase == "INSIDE_SINK_AFTER_SETTLE"]
     stages = {
         "navigation_gate": "NAV_SETTLE" in completed,
         "grasp": "GRASP_HOLD" in completed,
@@ -120,17 +187,19 @@ def audit(bench, entry, video_dir=None):
         "retraction": "RETRACT_BACK" in completed,
         "final_check_success": success,
     }
-    nav_events = {phase: info for phase, info in fsm.events if phase in NAV_PHASES}
+    nav_events = {phase: info for phase, info in events if phase in NAV_PHASES}
     result = {
         "episode_id": entry["episode_id"], "split": entry["split"], "initial_state_hash_match": hash_match,
         "success": success, "stages": stages, "failure": failure, "failure_category": failure_category(failure),
         "steps": steps, "wall_time_s": time.time() - started, **host_info(),
-        "expert_version": EXPERT_VERSION, "expert_commit": EXPERT_COMMIT,
+        "expert_version": EXPERT_VERSION, "expert_status": EXPERT_STATUS, "expert_commit": EXPERT_COMMIT,
         "expert_config": dataclasses.asdict(bench.config), "nav_config": dataclasses.asdict(bench.nav_config),
         "start_distance_m": nav_plan["distance"], "path_waypoints": len(nav_plan["path"]),
         "navigation_final": nav_events.get("NAV_SETTLE"),
         "final_object_in_sink_partial": bool(OU.obj_inside_of(raw_env, "obj", raw_env.sink, partial_check=True)),
-        **stats, "events": fsm.events,
+        "timing": timing, "dense_navigation_clearance": dense if dense_clearance else None,
+        "navigation_plan": None if fsm is None else {k: v for k, v in fsm.plans.get("navigation_v3", {}).items() if k != "cells"},
+        **stats, "events": events,
     }
     return result
 
@@ -140,7 +209,8 @@ def main():
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST)
     parser.add_argument("--episodes", type=int, nargs="*", default=None, help="manifest indices (default: all)")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--video-dir", default=None, help="also save a free-camera diagnostic video per episode")
+    parser.add_argument("--video-dir", default=None, help="also save an overhead diagnostic video per episode")
+    parser.add_argument("--dense-clearance", action="store_true", help="exact clearance at every navigation step")
     args = parser.parse_args()
     manifest = json.load(open(args.manifest))
     entries = manifest["episodes"] if args.episodes is None else [manifest["episodes"][i] for i in args.episodes]
@@ -157,7 +227,7 @@ def main():
         raise SystemExit("reference goal offset differs from the manifest")
     default = lambda o: o.tolist() if isinstance(o, np.ndarray) else (o if isinstance(o, (str, int, bool)) else float(o))
     for entry in entries:
-        result = audit(bench, entry, args.video_dir)
+        result = audit(bench, entry, args.video_dir, args.dense_clearance)
         with open(os.path.join(args.output, f"{entry['episode_id']}.json"), "w") as file:
             json.dump(result, file, indent=1, default=default)
         s = result["stages"]

@@ -23,6 +23,7 @@ is reproduced here as importable functions.
 """
 
 import heapq
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -82,6 +83,41 @@ class NavConfig:
     rotate_first_yaw: float = 0.35      # |yaw error| above which translation is reduced while turning
     rotate_first_translation_scale: float = 0.25
     avoid_stall_steps: int = 150        # abort if no safe progressing command for this many steps
+    # Planner selection. "circular_astar" (default): the original GridPlanner path and controller, used
+    # by every earlier demonstration and by replay. "footprint_lattice" (expert v3): SE(2) lattice plan on
+    # the real collision geometry (footprint_planner.py), explicit rotate/translate tracking, and a
+    # runtime safety layer; selected explicitly for benchmark-v1 expert generation.
+    planner: str = "circular_astar"
+    lattice_region: dict = None          # planner region {"x": [..], "y": [..], "yaw": [..]} (benchmark)
+    lattice_cache_dir: str = "/common/users/im484/saga_benchmark/cache/footprint_margin"
+    lattice_manifest_sha256: str = None  # part of the cache key (set by benchmark_expert_configs)
+    # v3 speed schedule by cached margin m (clearance minus abort threshold) at the current pose:
+    #   m >= 0.15: v3_speed_open / v3_yaw_rate_open; 0.10 <= m < 0.15: *_mid; m < 0.10: *_low (+ longer look-ahead)
+    v3_speed_open: float = 0.15
+    v3_speed_mid: float = 0.10
+    v3_speed_low: float = 0.06
+    v3_yaw_rate_open: float = 0.4
+    v3_yaw_rate_mid: float = 0.3
+    v3_yaw_rate_low: float = 0.2
+    v3_horizon: int = 10
+    v3_horizon_low: int = 15
+    v3_waypoint_tolerance: float = 0.015
+    v3_yaw_tolerance: float = 0.02
+    v3_settle_speed: float = 0.01
+    v3_stall_steps: int = 60
+    v3_segment_timeout: int = 600
+    # Final fine alignment (same discipline: rotate in place, then axis-separated corrections at a fixed
+    # speed with a coasting stop, then exact-zero settle); accepted by the original 1 cm / 0.01 rad gate.
+    v3_fine_speed: float = 0.05
+    v3_fine_yaw_rate: float = 0.15
+    v3_fine_tolerance: float = 0.007
+    v3_fine_yaw_tolerance: float = 0.007
+    v3_fine_attempts: int = 12
+    # First-order base response per control step, v[t+1] = v_c + (v[t] - v_c) * a. PROVISIONAL values:
+    # to be replaced by the open-space calibration fit (benchmark/calibrate_base_dynamics.py) before
+    # expert v3 is validated; the fine speeds above are likewise provisional.
+    v3_response_xy: float = 0.8
+    v3_response_yaw: float = 0.8
 
 
 @dataclass
@@ -347,6 +383,9 @@ class NavExpertFSM(ExpertFSM):
         self.predictor = None
         self.avoid_stats = {"steps_checked": 0, "steps_modified": 0, "min_predicted_margin": np.inf, "stalled_steps": 0}
         self._target = None
+        self.v3 = None
+        if nav_config is not None and nav_config.planner == "footprint_lattice":
+            self._init_v3(config, nav_config)
         if nav_config is not None and nav_config.footprint_avoidance:
             thresholds = {"base": nav_config.min_base_clearance_nav, "arm": nav_config.min_arm_clearance_nav,
                           "gripper": config.min_gripper_clearance}
@@ -471,7 +510,254 @@ class NavExpertFSM(ExpertFSM):
         self.avoid_stats["stalled_steps"] = 0
         return best
 
+    # ------------------------------------------------------------------ expert v3 (footprint lattice)
+
+    def _init_v3(self, config, nav):
+        import footprint_planner as FP
+
+        thresholds = {"base": nav.min_base_clearance_nav, "arm": nav.min_arm_clearance_nav,
+                      "gripper": config.min_gripper_clearance}
+        exact = FP.ExactMargin(self.raw_env, thresholds, self.object_geoms)
+        qpos = self.data.qpos.copy()
+        pconfig = FP.PlannerConfig()
+        t = time.perf_counter()
+        field, cache = FP.load_or_build_field(self.raw_env, exact, qpos, self.start["ready_qpos"], nav.lattice_region,
+                                              pconfig, thresholds, self.object_geoms, nav.lattice_manifest_sha256,
+                                              allow_build=False,
+                                              cache_dir=nav.lattice_cache_dir)
+        cache["load_or_build_seconds"] = time.perf_counter() - t
+        base_position, base_yaw = SU.base_pose(self.raw_env)
+        plan = FP.plan_path(field, exact, qpos, base_position[:2], base_yaw, self.start["base_xy"], self.start["base_yaw"],
+                            pconfig)
+        plan["cache"] = cache
+        self.events.append(("NAV_PLAN", {k: v for k, v in plan.items() if k != "waypoints"} | {"num_waypoints": plan.get("num_waypoints")}))
+        self.plans["navigation_v3"] = plan
+        if plan["status"] != "ok":
+            raise ExpertAbort("NAV_PLAN", f"navigation_infeasible: {plan.get('reason')}")
+        self.v3 = {"exact": exact, "field": field, "config": pconfig, "plan": plan, "rejected": 0, "stalled": 0,
+                   "min_predicted": np.inf, "checks": 0, "check_seconds": 0.0, "last_xy": base_position[:2].copy(),
+                   "last_yaw": base_yaw, "velocity": np.zeros(3), "steps": 0, "measured_at": float(self.data.time)}
+
+    def _v3_cached_margin(self):
+        field = self.v3["field"]
+        position, yaw = SU.base_pose(self.raw_env)
+        i = int(np.argmin(np.abs(field["xs"] - position[0])))
+        j = int(np.argmin(np.abs(field["ys"] - position[1])))
+        k = int(np.argmin(np.abs(np.angle(np.exp(1j * (field["yaws"] - yaw))))))
+        return float(field["node"][i, j, k])
+
+    def _v3_schedule(self):
+        nav = self.nav_config
+        m = self._v3_cached_margin()
+        if m >= 0.15:
+            return nav.v3_speed_open, nav.v3_yaw_rate_open, nav.v3_horizon, m
+        if m >= 0.10:
+            return nav.v3_speed_mid, nav.v3_yaw_rate_mid, nav.v3_horizon, m
+        return nav.v3_speed_low, nav.v3_yaw_rate_low, nav.v3_horizon_low, m
+
+    def _v3_measure(self):
+        """Pose and measured velocity (finite difference over the last control step; cached per step)."""
+        now = float(self.data.time)
+        if self.v3.get("measured_at") == now:
+            return self.v3["last_xy"].copy(), self.v3["last_yaw"], self.v3["velocity"].copy()
+        self.v3["measured_at"] = now
+        position, yaw = SU.base_pose(self.raw_env)
+        dt = 1.0 / float(self.raw_env.control_freq)
+        v = np.array([(position[0] - self.v3["last_xy"][0]) / dt, (position[1] - self.v3["last_xy"][1]) / dt,
+                      float(np.angle(np.exp(1j * (yaw - self.v3["last_yaw"])))) / dt])
+        self.v3["last_xy"], self.v3["last_yaw"], self.v3["velocity"] = position[:2].copy(), yaw, v
+        return position[:2].copy(), yaw, v
+
+    def _v3_admissible(self, world_command, horizon):
+        """
+        Exact swept-footprint check of a world-frame command [vx, vy, wz]: first-order response from the
+        measured velocity for `horizon` steps, then a commanded stop until the predicted speed is below
+        1 mm/s (stopping distance). Samples at steps 2, 5, horizon and the predicted stop pose.
+        """
+        nav, v3 = self.nav_config, self.v3
+        dt = 1.0 / float(self.raw_env.control_freq)
+        a = np.array([nav.v3_response_xy, nav.v3_response_xy, nav.v3_response_yaw])
+        position, yaw = SU.base_pose(self.raw_env)
+        xy, h, v = position[:2].copy(), float(yaw), v3["velocity"].copy()
+        samples, k = [], 0
+        command = np.asarray(world_command, dtype=float)
+        while True:
+            k += 1
+            target = command if k <= horizon else np.zeros(3)
+            v = target + (v - target) * a
+            xy = xy + dt * v[:2]
+            h += dt * v[2]
+            if k in (2, 5, horizon):
+                samples.append((xy.copy(), h))
+            if k > horizon and np.linalg.norm(v[:2]) < 1e-3 and abs(v[2]) < 1e-3:
+                samples.append((xy.copy(), h))
+                break
+            if k > horizon + 200:
+                samples.append((xy.copy(), h))
+                break
+        qpos = self.data.qpos.copy()
+        t = time.perf_counter()
+        worst, where = np.inf, None
+        for sxy, sh in samples:
+            m, w = v3["exact"](qpos, sxy, sh, v3["config"].exact_cap)
+            v3["checks"] += 1
+            if m < worst:
+                worst, where = m, w
+        v3["check_seconds"] += time.perf_counter() - t
+        v3["min_predicted"] = min(v3["min_predicted"], worst)
+        return worst >= v3["config"].buffer, worst, where
+
+    def _v3_command(self, phase, index, world_command, horizon, mode):
+        """Safety layer + emit: the command is sent only if admissible, else an exact stop."""
+        admissible, margin, where = self._v3_admissible(world_command, horizon)
+        if admissible:
+            self.v3["stalled"] = 0
+            command = np.asarray(world_command, dtype=float)
+        else:
+            self.v3["rejected"] += 1
+            self.v3["stalled"] += 1
+            if self.v3["stalled"] > self.nav_config.v3_stall_steps:
+                raise ExpertAbort(phase, f"navigation_stall: no admissible command for {self.v3['stalled']} steps "
+                                         f"(predicted margin {margin:.4f} near {where})")
+            command = np.zeros(3)
+        _, yaw = SU.base_pose(self.raw_env)
+        c, s = np.cos(yaw), np.sin(yaw)
+        base_frame = np.array([c * command[0] + s * command[1], -s * command[0] + c * command[1], command[2]])
+        nav_command = self._nav_command(phase, index, base_frame)
+        nav_command.info.update(v3_mode=mode, v3_admissible=bool(admissible), v3_predicted_margin=float(margin))
+        return nav_command
+
+    def _v3_stop(self, phase, index_start, mode):
+        """Command exact zero until the base is still."""
+        nav = self.nav_config
+        for index in range(index_start, index_start + 200):
+            self._v3_measure()
+            v = self.v3["velocity"]
+            if np.linalg.norm(v[:2]) < nav.v3_settle_speed and abs(v[2]) < nav.v3_settle_speed:
+                return index
+            yield_command = self._v3_command(phase, index, np.zeros(3), nav.v3_horizon, mode)
+            yield yield_command
+        raise ExpertAbort(phase, "navigation_stall: base did not come to rest")
+
+    def _v3_rotate(self, target_yaw, index, phase="NAV_FOLLOW", rate=None, tolerance=None):
+        nav = self.nav_config
+        tolerance = nav.v3_yaw_tolerance if tolerance is None else tolerance
+        while True:
+            _, yaw, v = self._v3_measure()
+            error = float(np.angle(np.exp(1j * (target_yaw - yaw))))
+            if abs(error) <= tolerance:
+                break
+            _, scheduled_rate, horizon, _ = self._v3_schedule()
+            rate_now = scheduled_rate if rate is None else min(rate, scheduled_rate)
+            # stop early by the predicted coasting angle of the first-order response
+            coast = abs(v[2]) * nav.v3_response_yaw / max(1e-6, 1.0 - nav.v3_response_yaw) / float(self.raw_env.control_freq)
+            if abs(error) <= coast:
+                index = yield from self._v3_stop(phase, index, "rotate_stop")
+                continue
+            yield self._v3_command(phase, index, np.array([0.0, 0.0, np.sign(error) * rate_now]), horizon, "rotate")
+            index += 1
+            if index > nav.v3_segment_timeout * 4:
+                raise ExpertAbort(phase, "navigation_stall: rotation timeout")
+        return index
+
+    def _v3_translate(self, p0, p1, index, phase="NAV_FOLLOW", speed=None, tolerance=None, axis_only=False):
+        """Pure translation along a lattice direction (world axes or diagonals) at constant yaw."""
+        nav = self.nav_config
+        tolerance = nav.v3_waypoint_tolerance if tolerance is None else tolerance
+        p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+        for attempt in range(4):
+            position, yaw, v = self._v3_measure()
+            delta = p1 - position
+            if np.linalg.norm(delta) <= tolerance:
+                return index
+            # axis-aligned or diagonal unit direction: every slide-joint command is exactly zero or a
+            # full-magnitude value (no tiny components that the deadband compensation would amplify)
+            if attempt == 0 and not axis_only and np.linalg.norm(p1 - p0) > 1e-9:
+                direction = (p1 - p0) / np.linalg.norm(p1 - p0)
+            else:
+                axis = int(np.argmax(np.abs(delta)))
+                direction = np.zeros(2)
+                direction[axis] = np.sign(delta[axis])
+            steps = 0
+            while True:
+                position, yaw, v = self._v3_measure()
+                remaining = float(np.dot(p1 - position, direction))
+                scheduled, _, horizon, _ = self._v3_schedule()
+                speed_now = scheduled if speed is None else min(speed, scheduled)
+                along = float(np.dot(v[:2], direction))
+                coast = max(0.0, along) * nav.v3_response_xy / max(1e-6, 1.0 - nav.v3_response_xy) / float(self.raw_env.control_freq)
+                if remaining <= coast:
+                    break
+                yield self._v3_command(phase, index, np.array([*(speed_now * direction), 0.0]), horizon,
+                                       "translate" if attempt == 0 and not axis_only else "correct")
+                index += 1
+                steps += 1
+                if steps > nav.v3_segment_timeout:
+                    raise ExpertAbort(phase, "navigation_stall: translation timeout")
+            index = yield from self._v3_stop(phase, index, "settle")
+        return index
+
+    def _navigation_v3(self):
+        nav, plan = self.nav_config, self.v3["plan"]
+        waypoints = plan["waypoints"]
+        index = 0
+        for a, b in zip(waypoints[:-1], waypoints[1:]):
+            if b["segment_to_here"] == "rotate":
+                index = yield from self._v3_rotate(b["yaw"], index)
+            else:
+                index = yield from self._v3_translate(a["xy"], b["xy"], index)
+                _, yaw, _ = self._v3_measure()
+                if abs(np.angle(np.exp(1j * (b["yaw"] - yaw)))) > nav.v3_yaw_tolerance:
+                    index = yield from self._v3_rotate(b["yaw"], index)
+        self.events.append(("NAV_FOLLOW", {"steps": index, "planner": "footprint_lattice"}))
+
+    def _v3_final_alignment(self):
+        """
+        Fine alignment to the continuous goal with the v3 discipline (rotate in place, axis-separated
+        corrections at v3_fine_speed with a coasting stop, exact-zero settle), every command through the
+        safety layer. Accepted by the original criteria: |position error| <= nav_position_tolerance and
+        |yaw error| <= nav_yaw_tolerance (1 cm, 0.01 rad) after NAV_SETTLE with base speed < settle_speed.
+        """
+        nav, goal_xy, goal_yaw = self.nav_config, np.asarray(self.start["base_xy"], float), float(self.start["base_yaw"])
+        index = 0
+        for attempt in range(nav.v3_fine_attempts):
+            position, yaw, _ = self._v3_measure()
+            distance = float(np.linalg.norm(goal_xy - position))
+            yaw_error = float(np.angle(np.exp(1j * (goal_yaw - yaw))))
+            if distance <= nav.v3_fine_tolerance and abs(yaw_error) <= nav.v3_fine_yaw_tolerance:
+                break
+            if abs(yaw_error) > nav.v3_fine_yaw_tolerance:
+                index = yield from self._v3_rotate(goal_yaw, index, phase="NAV_ALIGN", rate=nav.v3_fine_yaw_rate,
+                                                   tolerance=nav.v3_fine_yaw_tolerance)
+            else:
+                index = yield from self._v3_translate(position, goal_xy, index, phase="NAV_ALIGN", speed=nav.v3_fine_speed,
+                                                      tolerance=nav.v3_fine_tolerance, axis_only=True)
+        else:
+            raise ExpertAbort("NAV_ALIGN", f"fine alignment did not converge in {nav.v3_fine_attempts} attempts "
+                                           f"(position error {distance:.4f} m, yaw error {yaw_error:.4f} rad)")
+        self.events.append(("NAV_ALIGN", {"steps": index, "position_error": distance, "yaw_error": abs(yaw_error)}))
+        for index in range(nav.settle_timeout):
+            self._v3_measure()
+            yield self._v3_command("NAV_SETTLE", index, np.zeros(3), nav.v3_horizon, "settle")
+            _, distance, yaw_error = self._base_command(goal_xy, goal_yaw, final=True)
+            speed = float(np.linalg.norm(self.v3["velocity"][:2]))
+            if index >= 5 and speed < nav.settle_speed:
+                if distance > nav.nav_position_tolerance or yaw_error > nav.nav_yaw_tolerance:
+                    raise ExpertAbort("NAV_SETTLE", f"base settled outside tolerance ({distance:.4f} m, {yaw_error:.4f} rad)")
+                self.events.append(("NAV_SETTLE", {"steps": index + 1, "position_error": distance, "yaw_error": yaw_error}))
+                v3 = self.v3
+                self.events.append(("NAV_V3", {"exact_checks_runtime": v3["checks"], "runtime_check_seconds": v3["check_seconds"],
+                                               "rejected_commands": v3["rejected"], "min_predicted_margin": v3["min_predicted"],
+                                               "planner_exact_evaluations": v3["plan"]["exact_evaluations"],
+                                               "planner_exact_seconds": v3["plan"]["exact_seconds"]}))
+                return
+        raise ExpertAbort("NAV_SETTLE", "base did not settle")
+
     def navigation(self):
+        if self.v3 is not None:
+            yield from self._navigation_v3()
+            yield from self._v3_final_alignment()
+            return
         nav, goal_xy, goal_yaw = self.nav_config, self.start["base_xy"], self.start["base_yaw"]
         path = [np.asarray(p) for p in self.nav_plan["path"]][1:]
         start_yaw = self.nav_plan["yaw"]

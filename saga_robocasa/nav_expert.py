@@ -108,16 +108,20 @@ class NavConfig:
     v3_segment_timeout: int = 600
     # Final fine alignment (same discipline: rotate in place, then axis-separated corrections at a fixed
     # speed with a coasting stop, then exact-zero settle); accepted by the original 1 cm / 0.01 rad gate.
-    v3_fine_speed: float = 0.05
+    v3_fine_speed: float = 0.06            # lowest calibrated speed (tracked exactly)
     v3_fine_yaw_rate: float = 0.15
     v3_fine_tolerance: float = 0.007
     v3_fine_yaw_tolerance: float = 0.007
     v3_fine_attempts: int = 12
-    # First-order base response per control step, v[t+1] = v_c + (v[t] - v_c) * a. PROVISIONAL values:
-    # to be replaced by the open-space calibration fit (benchmark/calibrate_base_dynamics.py) before
-    # expert v3 is validated; the fine speeds above are likewise provisional.
-    v3_response_xy: float = 0.8
-    v3_response_yaw: float = 0.8
+    # First-order base response per control step, v[t+1] = v_c + (v[t] - v_c) * a, CALIBRATED (job 679746,
+    # rlab7; benchmark/calibrate_base_dynamics.py): translation-only fit a_x = 0.325, a_y = 0.370 (residual
+    # ~2 mm/s; 10-step position error <= 4.5 mm), the larger used for both axes (conservative coasting:
+    # predicted 4.8 mm vs measured 3.4 mm from 0.2 m/s); joint-only yaw fit a = 0.139 (residual 1.0 mrad/s;
+    # 0.126 if the compensated-yaw segments are pooled in, which the fit excludes). Compensated-yaw segments
+    # are never used for fitting (the compensation is not tracked dynamically; expert v3 rotates joint-only).
+    # Re-analysis: calibrate_base_dynamics.py --refit-from (calibration_refit_by_segment_type.json).
+    v3_response_xy: float = 0.370
+    v3_response_yaw: float = 0.139
 
 
 @dataclass
@@ -402,7 +406,8 @@ class NavExpertFSM(ExpertFSM):
         if velocity is not None:
             _, base_yaw = SU.base_pose(self.raw_env)
             action["action.base_motion"][:3] = np.clip(
-                self.base_model.base_motion(velocity[0], velocity[1], velocity[2], base_yaw), -1.0, 1.0
+                self.base_model.base_motion(velocity[0], velocity[1], velocity[2], base_yaw,
+                                            compensate_yaw_offset=self.v3 is None), -1.0, 1.0
             ).astype(np.float32)
         return action
 
@@ -517,7 +522,8 @@ class NavExpertFSM(ExpertFSM):
 
         thresholds = {"base": nav.min_base_clearance_nav, "arm": nav.min_arm_clearance_nav,
                       "gripper": config.min_gripper_clearance}
-        exact = FP.ExactMargin(self.raw_env, thresholds, self.object_geoms)
+        offset = FP.axis_offset()
+        exact = FP.ExactMargin(self.raw_env, thresholds, self.object_geoms, offset)
         qpos = self.data.qpos.copy()
         pconfig = FP.PlannerConfig()
         t = time.perf_counter()
@@ -527,22 +533,25 @@ class NavExpertFSM(ExpertFSM):
                                               cache_dir=nav.lattice_cache_dir)
         cache["load_or_build_seconds"] = time.perf_counter() - t
         base_position, base_yaw = SU.base_pose(self.raw_env)
-        plan = FP.plan_path(field, exact, qpos, base_position[:2], base_yaw, self.start["base_xy"], self.start["base_yaw"],
-                            pconfig)
+        # plan in yaw-axis coordinates (in-place rotations keep the yaw-axis point fixed)
+        start_axis = FP.axis_from_site(base_position[:2], base_yaw, offset)
+        goal_axis = FP.axis_from_site(self.start["base_xy"], self.start["base_yaw"], offset)
+        plan = FP.plan_path(field, exact, qpos, start_axis, base_yaw, goal_axis, self.start["base_yaw"], pconfig)
         plan["cache"] = cache
         self.events.append(("NAV_PLAN", {k: v for k, v in plan.items() if k != "waypoints"} | {"num_waypoints": plan.get("num_waypoints")}))
         self.plans["navigation_v3"] = plan
         if plan["status"] != "ok":
             raise ExpertAbort("NAV_PLAN", f"navigation_infeasible: {plan.get('reason')}")
         self.v3 = {"exact": exact, "field": field, "config": pconfig, "plan": plan, "rejected": 0, "stalled": 0,
-                   "min_predicted": np.inf, "checks": 0, "check_seconds": 0.0, "last_xy": base_position[:2].copy(),
+                   "min_predicted": np.inf, "checks": 0, "check_seconds": 0.0, "offset": offset,
+                   "last_xy": start_axis.copy(), "last_site": base_position[:2].copy(),
                    "last_yaw": base_yaw, "velocity": np.zeros(3), "steps": 0, "measured_at": float(self.data.time)}
 
     def _v3_cached_margin(self):
         field = self.v3["field"]
-        position, yaw = SU.base_pose(self.raw_env)
-        i = int(np.argmin(np.abs(field["xs"] - position[0])))
-        j = int(np.argmin(np.abs(field["ys"] - position[1])))
+        axis, yaw, _ = self._v3_measure()
+        i = int(np.argmin(np.abs(field["xs"] - axis[0])))
+        j = int(np.argmin(np.abs(field["ys"] - axis[1])))
         k = int(np.argmin(np.abs(np.angle(np.exp(1j * (field["yaws"] - yaw))))))
         return float(field["node"][i, j, k])
 
@@ -556,29 +565,38 @@ class NavExpertFSM(ExpertFSM):
         return nav.v3_speed_low, nav.v3_yaw_rate_low, nav.v3_horizon_low, m
 
     def _v3_measure(self):
-        """Pose and measured velocity (finite difference over the last control step; cached per step)."""
+        """
+        Yaw-axis position, yaw and measured yaw-axis velocity [vx, vy, wz] (finite difference over the
+        last control step; cached per step). The base-centre site is kept in v3["last_site"].
+        """
+        import footprint_planner as FP
+
         now = float(self.data.time)
         if self.v3.get("measured_at") == now:
             return self.v3["last_xy"].copy(), self.v3["last_yaw"], self.v3["velocity"].copy()
         self.v3["measured_at"] = now
         position, yaw = SU.base_pose(self.raw_env)
+        axis = FP.axis_from_site(position[:2], yaw, self.v3["offset"])
         dt = 1.0 / float(self.raw_env.control_freq)
-        v = np.array([(position[0] - self.v3["last_xy"][0]) / dt, (position[1] - self.v3["last_xy"][1]) / dt,
+        v = np.array([(axis[0] - self.v3["last_xy"][0]) / dt, (axis[1] - self.v3["last_xy"][1]) / dt,
                       float(np.angle(np.exp(1j * (yaw - self.v3["last_yaw"])))) / dt])
-        self.v3["last_xy"], self.v3["last_yaw"], self.v3["velocity"] = position[:2].copy(), yaw, v
-        return position[:2].copy(), yaw, v
+        self.v3["last_xy"], self.v3["last_yaw"], self.v3["velocity"] = axis.copy(), yaw, v
+        self.v3["last_site"] = position[:2].copy()
+        return axis.copy(), yaw, v
 
     def _v3_admissible(self, world_command, horizon):
         """
-        Exact swept-footprint check of a world-frame command [vx, vy, wz]: first-order response from the
-        measured velocity for `horizon` steps, then a commanded stop until the predicted speed is below
-        1 mm/s (stopping distance). Samples at steps 2, 5, horizon and the predicted stop pose.
+        Exact swept-footprint check of a world-frame command [vx, vy, wz] (vx, vy: yaw-axis translation;
+        wz: joint-only yaw rate about the yaw axis): first-order response from the measured yaw-axis
+        velocity for `horizon` steps, then a commanded stop until the predicted speed is below 1 mm/s
+        (stopping distance). The site follows the arc site = axis + R(yaw) @ offset (ExactMargin).
+        Samples at steps 2, 5, horizon and the predicted stop pose.
         """
         nav, v3 = self.nav_config, self.v3
         dt = 1.0 / float(self.raw_env.control_freq)
         a = np.array([nav.v3_response_xy, nav.v3_response_xy, nav.v3_response_yaw])
-        position, yaw = SU.base_pose(self.raw_env)
-        xy, h, v = position[:2].copy(), float(yaw), v3["velocity"].copy()
+        axis, yaw, _ = self._v3_measure()
+        xy, h, v = axis.copy(), float(yaw), v3["velocity"].copy()
         samples, k = [], 0
         command = np.asarray(world_command, dtype=float)
         while True:
@@ -660,13 +678,21 @@ class NavExpertFSM(ExpertFSM):
                 raise ExpertAbort(phase, "navigation_stall: rotation timeout")
         return index
 
-    def _v3_translate(self, p0, p1, index, phase="NAV_FOLLOW", speed=None, tolerance=None, axis_only=False):
-        """Pure translation along a lattice direction (world axes or diagonals) at constant yaw."""
+    def _v3_position(self, frame):
+        axis, yaw, v = self._v3_measure()
+        return (axis if frame == "axis" else self.v3["last_site"].copy()), yaw, v
+
+    def _v3_translate(self, p0, p1, index, phase="NAV_FOLLOW", speed=None, tolerance=None, axis_only=False, frame="axis"):
+        """
+        Pure translation along a lattice direction (world axes or diagonals) at constant yaw. p0/p1 are
+        yaw-axis points (frame="axis", plan segments) or base-centre sites (frame="site", fine alignment);
+        at constant yaw both points move identically.
+        """
         nav = self.nav_config
         tolerance = nav.v3_waypoint_tolerance if tolerance is None else tolerance
         p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
         for attempt in range(4):
-            position, yaw, v = self._v3_measure()
+            position, yaw, v = self._v3_position(frame)
             delta = p1 - position
             if np.linalg.norm(delta) <= tolerance:
                 return index
@@ -680,7 +706,7 @@ class NavExpertFSM(ExpertFSM):
                 direction[axis] = np.sign(delta[axis])
             steps = 0
             while True:
-                position, yaw, v = self._v3_measure()
+                position, yaw, v = self._v3_position(frame)
                 remaining = float(np.dot(p1 - position, direction))
                 scheduled, _, horizon, _ = self._v3_schedule()
                 speed_now = scheduled if speed is None else min(speed, scheduled)
@@ -721,7 +747,7 @@ class NavExpertFSM(ExpertFSM):
         nav, goal_xy, goal_yaw = self.nav_config, np.asarray(self.start["base_xy"], float), float(self.start["base_yaw"])
         index = 0
         for attempt in range(nav.v3_fine_attempts):
-            position, yaw, _ = self._v3_measure()
+            position, yaw, _ = self._v3_position("site")
             distance = float(np.linalg.norm(goal_xy - position))
             yaw_error = float(np.angle(np.exp(1j * (goal_yaw - yaw))))
             if distance <= nav.v3_fine_tolerance and abs(yaw_error) <= nav.v3_fine_yaw_tolerance:
@@ -731,7 +757,7 @@ class NavExpertFSM(ExpertFSM):
                                                    tolerance=nav.v3_fine_yaw_tolerance)
             else:
                 index = yield from self._v3_translate(position, goal_xy, index, phase="NAV_ALIGN", speed=nav.v3_fine_speed,
-                                                      tolerance=nav.v3_fine_tolerance, axis_only=True)
+                                                      tolerance=nav.v3_fine_tolerance, axis_only=True, frame="site")
         else:
             raise ExpertAbort("NAV_ALIGN", f"fine alignment did not converge in {nav.v3_fine_attempts} attempts "
                                            f"(position error {distance:.4f} m, yaw error {yaw_error:.4f} rad)")

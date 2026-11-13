@@ -640,11 +640,24 @@ class BaseActionModel:
         forward_side = self._rotation(base_yaw).T @ site_world
         return np.array([forward_side[0], forward_side[1], omega])
 
-    def base_motion(self, forward, side, yaw_rate, base_yaw, minimum_speed=0.003, minimum_yaw_rate=0.003):
-        """Inverse with deadband compensation: base-frame site velocity and yaw rate -> base_motion[0:3]."""
+    def base_motion(self, forward, side, yaw_rate, base_yaw, minimum_speed=0.003, minimum_yaw_rate=0.003,
+                    compensate_yaw_offset=True):
+        """
+        Inverse with deadband compensation: base-frame site velocity and yaw rate -> base_motion[0:3].
+
+        compensate_yaw_offset=True (default, all earlier experts and replays): the slide joints also
+        cancel the site motion caused by yawing about the offset yaw axis. Measured (calibration,
+        2026-10-22): this cancellation does not hold dynamically: with the yaw joint moving, the
+        commanded slide velocities are not tracked and the site drifts 0.09-0.20 m/s.
+        compensate_yaw_offset=False (opt-in, expert v3): (forward, side) is the velocity of the YAW-AXIS
+        point and the slides receive only that translation, so a pure rotation commands the slide joints
+        with exactly zero and the site moves on the modelled arc about the yaw axis (measured agreement
+        ~0.01 m/s).
+        """
         omega = 0.0 if abs(yaw_rate) < minimum_yaw_rate else yaw_rate
         site_world = self._rotation(base_yaw) @ np.array([forward, side])
-        joint_anchor = self._rotation(self.anchor_yaw).T @ (site_world - self._site_offset_velocity(omega, base_yaw))
+        offset_velocity = self._site_offset_velocity(omega, base_yaw) if compensate_yaw_offset else np.zeros(2)
+        joint_anchor = self._rotation(self.anchor_yaw).T @ (site_world - offset_velocity)
         return np.array([
             self._command(joint_anchor[1], self.translation_gain, self.translation_deadband, minimum_speed),
             self._command(joint_anchor[0], self.translation_gain, self.translation_deadband, minimum_speed),

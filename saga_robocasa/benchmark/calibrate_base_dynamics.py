@@ -10,10 +10,13 @@ without the yaw-axis offset compensation, a direction change without stopping, a
 component on top of a translation (the case that was amplified in episode_047). The arm holds its pose
 relative to the base. Any segment is aborted if the exact clearance margin drops below 0.10 m.
 
-Fits a first-order velocity response v[t+1] = v_c + (v[t] - v_c) * a per channel (world x, world y,
-yaw) with the steady state v_c from spot_utils.BaseActionModel, and reports one-step and ten-step
-pose-prediction errors for (P0) the instant model used by expert v2 and (P1) the first-order model
-started from the measured velocity.
+Fits a first-order velocity response v[t+1] = v_c + (v[t] - v_c) * a with the steady state v_c from
+spot_utils.BaseActionModel, SEPARATELY for translation (x, y; translation segments only) and joint-only
+yaw; compensated-yaw segments are reported as diagnostics and never used for fitting. Reports one-step
+and ten-step pose-prediction errors by segment type for the instant and first-order models.
+
+    # re-analyse an existing run without simulating (writes a new file under --output):
+    python saga_robocasa/benchmark/calibrate_base_dynamics.py --refit-from DIR --output NEW_DIR
 """
 
 import argparse
@@ -31,10 +34,116 @@ from nav_expert import FootprintPredictor  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def segment_kind(name):
+    if "compensated" in name:
+        return "yaw_compensated"
+    if "joint only" in name:
+        return "yaw_joint_only"
+    return "translation"  # single-axis, diagonal, direction change, tiny lateral component
+
+
+def _fit(rows, kinds, channels):
+    """Least-squares a in (v[t+1] - v_c) = a (v[t] - v_c), pooled over `channels` of segments of `kinds`."""
+    xs, ys = [], []
+    for row in rows:
+        if segment_kind(row["segment"]) not in kinds:
+            continue
+        log = row["log"]
+        for a, b in zip(log[:-1], log[1:]):
+            for ch in channels:
+                vc = b["steady_world"][ch]
+                xs.append(a["velocity_world"][ch] - vc)
+                ys.append(b["velocity_world"][ch] - vc)
+    x, y = np.array(xs), np.array(ys)
+    a = float(np.dot(x, y) / max(np.dot(x, x), 1e-12))
+    return {"a": a, "tau_steps": float(-1.0 / np.log(a)) if 0 < a < 1 else None,
+            "residual_rms": float(np.sqrt(np.mean((y - a * x) ** 2))), "pairs": int(len(x)), "segments": sorted(kinds)}
+
+
+def analyse(rows, dt, base_model):
+    """
+    Separate analyses (compensated-yaw segments are never used to fit translation dynamics):
+      translation_fit      per axis (x, y) on translation segments only
+      yaw_joint_only_fit   yaw channel on joint-only yaw segments; plus the arc check (measured site velocity
+                           vs the model's yaw-axis arc) for those segments
+      compensated_yaw      diagnostics only: commanded vs implied slide velocity and site drift
+      prediction_errors    by segment type, first-order model with the translation/joint-only fits
+    """
+    fits = {"translation_x": _fit(rows, {"translation"}, [0]), "translation_y": _fit(rows, {"translation"}, [1]),
+            "yaw_joint_only": _fit(rows, {"yaw_joint_only"}, [2])}
+    offset = np.asarray(base_model["yaw_axis_to_site_offset_base_frame"])
+    deadband, gain = base_model["translation_deadband"], base_model["translation_gain"]
+    rot = lambda h: np.array([[np.cos(h), -np.sin(h)], [np.sin(h), np.cos(h)]])
+    arc, compensated = [], []
+    for row in rows:
+        kind = segment_kind(row["segment"])
+        if kind not in ("yaw_joint_only", "yaw_compensated"):
+            continue
+        for s in row["log"][10:40]:
+            w = s["velocity_world"][2]
+            yaw_induced = w * (rot(s["yaw"]) @ np.array([-offset[1], offset[0]]))
+            implied_slide = np.array(s["velocity_world"][:2]) - yaw_induced
+            u = s["u"]
+            joint = lambda c: float(np.sign(c) * max(gain * abs(c) - deadband, 0.0))
+            commanded_slide = rot(base_model["anchor_yaw"]) @ np.array([joint(u[1]), joint(u[0])])
+            (arc if kind == "yaw_joint_only" else compensated).append(
+                {"implied_slide": implied_slide, "commanded_slide": commanded_slide,
+                 "site_speed": float(np.linalg.norm(s["velocity_world"][:2]))})
+    arc_err = [np.linalg.norm(r["implied_slide"] - r["commanded_slide"]) for r in arc]
+    comp_err = [np.linalg.norm(r["implied_slide"] - r["commanded_slide"]) for r in compensated]
+    diagnostics = {
+        "yaw_joint_only_arc": {"samples": len(arc), "slide_tracking_error_mean_mps": float(np.mean(arc_err)) if arc else None,
+                               "slide_tracking_error_max_mps": float(np.max(arc_err)) if arc else None},
+        "yaw_compensated": {"samples": len(compensated), "used_for_fitting": False,
+                            "slide_tracking_error_mean_mps": float(np.mean(comp_err)) if compensated else None,
+                            "slide_tracking_error_max_mps": float(np.max(comp_err)) if compensated else None,
+                            "site_drift_speed_max_mps": float(max(r["site_speed"] for r in compensated)) if compensated else None,
+                            "note": "the commanded offset compensation is not tracked while the yaw joint moves; "
+                                    "expert v3 rotates joint-only instead"}}
+    coeff = np.array([fits["translation_x"]["a"], fits["translation_y"]["a"], fits["yaw_joint_only"]["a"]])
+    errors = {}
+    for row in rows:
+        kind = segment_kind(row["segment"])
+        log = row["log"]
+        for t in range(len(log) - 10):
+            for k in (1, 10):
+                actual = np.array(log[t + k]["xy"]) - np.array(log[t]["xy"])
+                p0, p1 = np.zeros(2), np.zeros(2)
+                v = np.array(log[t]["velocity_world"])
+                for j in range(k):
+                    vc = np.array(log[t + 1 + j]["steady_world"])
+                    p0 += dt * vc[:2]
+                    v = vc + (v - vc) * coeff
+                    p1 += dt * v[:2]
+                for name, p in (("instant", p0), ("first_order", p1)):
+                    errors.setdefault(kind, {}).setdefault(name, {}).setdefault(f"{k}_step", []).append(float(np.linalg.norm(p - actual)))
+    summary = {kind: {model: {k: {"mean_m": float(np.mean(v)), "p95_m": float(np.percentile(v, 95)), "max_m": float(np.max(v))}
+                              for k, v in by_k.items()} for model, by_k in by_model.items()} for kind, by_model in errors.items()}
+    return {"fits": fits, "diagnostics": diagnostics, "prediction_errors": summary,
+            "controller_coefficients": {"v3_response_xy": max(fits["translation_x"]["a"], fits["translation_y"]["a"]),
+                                        "v3_response_yaw": fits["yaw_joint_only"]["a"],
+                                        "rule": "larger translation a (conservative coasting) and the joint-only yaw a"}}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
+    parser.add_argument("--refit-from", default=None,
+                        help="recompute the analysis from an existing calibration_summary.json/calibration_log.json "
+                             "directory without simulating (writes to --output, never to the source)")
     args = parser.parse_args()
+    if args.refit_from:
+        if os.path.abspath(args.refit_from) == os.path.abspath(args.output):
+            raise SystemExit("--output must differ from --refit-from (source outputs are never modified)")
+        rows = json.load(open(os.path.join(args.refit_from, "calibration_log.json")))
+        source = json.load(open(os.path.join(args.refit_from, "calibration_summary.json")))
+        analysis = analyse(rows, source["dt"], source["base_action_model"])
+        os.makedirs(args.output, exist_ok=True)
+        json.dump({"refit_from": os.path.abspath(args.refit_from), "source_host": source["host"], **analysis},
+                  open(os.path.join(args.output, "calibration_refit_by_segment_type.json"), "w"), indent=1, default=float)
+        print(json.dumps({"fits": analysis["fits"], "controller_coefficients": analysis["controller_coefficients"],
+                          "diagnostics": analysis["diagnostics"]}, indent=1, default=float))
+        return
     os.makedirs(args.output, exist_ok=True)
     manifest = json.load(open(os.path.join(ROOT, "benchmark", "manifests", "counter_to_sink_v1.json")))
     bench = BenchmarkEpisode()
@@ -150,47 +259,11 @@ def main():
                        "steps_to_90pct": int(np.argmax(np.linalg.norm(v[:40, :2], axis=1) >= 0.9 * max(1e-6, np.linalg.norm(steady[30, :2])))) if len(v) > 30 and np.linalg.norm(steady[30, :2]) > 0 else None})
         print(json.dumps(report[-1]), flush=True)
 
-    # ------------------------------------------------------------------ fit first-order response per channel
-    pairs = {0: [], 1: [], 2: []}
-    for row in rows:
-        log = row["log"]
-        for a, b in zip(log[:-1], log[1:]):
-            for ch in range(3):
-                vc = b["steady_world"][ch]
-                pairs[ch].append((a["velocity_world"][ch] - vc, b["velocity_world"][ch] - vc))
-    fit = {}
-    for ch, name in ((0, "x"), (1, "y"), (2, "yaw")):
-        x = np.array([p[0] for p in pairs[ch]])
-        y = np.array([p[1] for p in pairs[ch]])
-        a = float(np.dot(x, y) / max(np.dot(x, x), 1e-12))
-        fit[name] = {"a": a, "tau_steps": float(-1.0 / np.log(a)) if 0 < a < 1 else None,
-                     "residual_rms": float(np.sqrt(np.mean((y - a * x) ** 2)))}
-    print("fit", json.dumps(fit), flush=True)
-
-    # ------------------------------------------------------------------ prediction errors (P0 instant, P1 first-order)
-    coeff = np.array([fit["x"]["a"], fit["y"]["a"], fit["yaw"]["a"]])
-    errors = {"P0_instant": {1: [], 10: []}, "P1_first_order": {1: [], 10: []}}
-    for row in rows:
-        log = row["log"]
-        for t in range(len(log) - 10):
-            for k in (1, 10):
-                actual = np.array(log[t + k]["xy"]) - np.array(log[t]["xy"])
-                p0 = np.zeros(2)
-                p1 = np.zeros(2)
-                v = np.array(log[t]["velocity_world"])
-                for j in range(k):
-                    vc = np.array(log[t + 1 + j]["steady_world"])
-                    p0 += dt * vc[:2]
-                    v = vc + (v - vc) * coeff
-                    p1 += dt * v[:2]
-                errors["P0_instant"][k].append(float(np.linalg.norm(p0 - actual)))
-                errors["P1_first_order"][k].append(float(np.linalg.norm(p1 - actual)))
-    summary = {model_name: {f"{k}_step": {"mean_m": float(np.mean(v)), "p95_m": float(np.percentile(v, 95)), "max_m": float(np.max(v))}
-                            for k, v in by_k.items()} for model_name, by_k in errors.items()}
-    print("prediction errors", json.dumps(summary, indent=1), flush=True)
+    analysis = analyse(rows, dt, base_model.as_dict())
+    print("fits", json.dumps(analysis["fits"]), flush=True)
+    print("prediction errors", json.dumps(analysis["prediction_errors"], indent=1), flush=True)
     out = {"host": host_info(), "open_pose": {"xy": open_xy.tolist(), "yaw": goal_yaw, "margin": open_margin},
-           "segments": report, "first_order_fit": fit, "prediction_errors": summary,
-           "base_action_model": base_model.as_dict(), "dt": dt}
+           "segments": report, **analysis, "base_action_model": base_model.as_dict(), "dt": dt}
     json.dump(out, open(os.path.join(args.output, "calibration_summary.json"), "w"), indent=1, default=float)
     json.dump(rows, open(os.path.join(args.output, "calibration_log.json"), "w"), default=float)
     print("wrote", args.output)

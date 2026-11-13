@@ -72,14 +72,19 @@ def main():
 
     # ---------------------------------------------------------------- 2. episode_047
     base_position, base_yaw = SU.base_pose(raw_env)
+    # planner poses are yaw-axis poses (footprint_planner v2); convert the site-based start and goal
+    offset = FP.axis_offset()
+    start_axis = FP.axis_from_site(base_position[:2], base_yaw, offset)
+    goal_axis = FP.axis_from_site(start["base_xy"], start["base_yaw"], offset)
     old = []
     for a, b in zip(nav_plan["path"][:-1], nav_plan["path"][1:]):
         for f in np.linspace(0, 1, int(np.ceil(np.linalg.norm(np.subtract(b, a)) / 0.02)) + 1):
             xy = np.asarray(a) + f * (np.subtract(b, a))
             yaw = base_yaw + f * np.angle(np.exp(1j * (start["base_yaw"] - base_yaw)))
-            old.append((xy.tolist(), float(yaw), exact(qpos, xy, yaw, pconfig.exact_cap)[0]))
+            # nav_plan["path"] is the old circular planner's site path; ExactMargin takes yaw-axis points
+            old.append((xy.tolist(), float(yaw), exact(qpos, FP.axis_from_site(xy, yaw, offset), yaw, pconfig.exact_cap)[0]))
     old_min = min(m for _, _, m in old)
-    plan = FP.plan_path(field, exact, qpos, base_position[:2], base_yaw, start["base_xy"], start["base_yaw"], pconfig)
+    plan = FP.plan_path(field, exact, qpos, start_axis, base_yaw, goal_axis, start["base_yaw"], pconfig)
     checks = {}
     checks["old_straight_path_rejected"] = bool(old_min < pconfig.buffer)
     cells = [tuple(c) for c in plan.get("cells", [])]
@@ -98,15 +103,15 @@ def main():
             if d[0] and d[1]:
                 corner_ok &= bool(field["node"][a[0] + d[0], a[1], a[2]] >= pconfig.buffer and field["node"][a[0], a[1] + d[1], a[2]] >= pconfig.buffer)
         edge_ok &= bool(np.isfinite(mid) and mid >= pconfig.buffer)
-    straight = np.asarray(start["base_xy"]) - base_position[:2]
-    offsets = [float(np.cross(straight, np.asarray(w["xy"]) - base_position[:2]) / np.linalg.norm(straight)) for w in plan.get("waypoints", [])]
+    straight = goal_axis - start_axis
+    offsets = [float(np.cross(straight, np.asarray(w["xy"]) - start_axis) / np.linalg.norm(straight)) for w in plan.get("waypoints", [])]
     last = plan["waypoints"][-1] if plan.get("waypoints") else None
     checks.update(
         planner_status_ok=plan["status"] == "ok",
         detour_found=bool(offsets and max(abs(o) for o in offsets) > 0.5),
         all_nodes_pass_cached_buffer=bool(node_ok), all_edges_pass_cached_buffer=bool(edge_ok), no_corner_cutting=bool(corner_ok),
         exact_verification_passes=bool(plan.get("exact_min_margin", -1) >= pconfig.buffer and not plan.get("cache_discrepancies")),
-        reaches_continuous_goal=bool(last is not None and np.allclose(last["xy"], start["base_xy"], atol=1e-12)
+        reaches_continuous_goal=bool(last is not None and np.allclose(last["xy"], goal_axis, atol=1e-12)
                                      and abs(last["yaw"] - start["base_yaw"]) < 1e-12))
     report["episode_047"] = {"old_straight_path_min_exact_margin": old_min, "plan": plan, "max_offset_from_straight_line_m": max(map(abs, offsets)) if offsets else None,
                              "checks": checks}
@@ -124,7 +129,7 @@ def main():
         blocked[max(0, mid_cell[0] - 1):mid_cell[0] + 2, :, :] = True
     else:
         blocked[:, max(0, mid_cell[1] - 1):mid_cell[1] + 2, :] = True
-    blocked_plan = FP.plan_path(field, exact, qpos, base_position[:2], base_yaw, start["base_xy"], start["base_yaw"], pconfig, blocked=blocked)
+    blocked_plan = FP.plan_path(field, exact, qpos, start_axis, base_yaw, goal_axis, start["base_yaw"], pconfig, blocked=blocked)
     report["blocked_case"] = {"status": blocked_plan["status"], "reason": blocked_plan.get("reason"),
                               "expanded_nodes": blocked_plan.get("expanded_nodes")}
     print("blocked", report["blocked_case"], flush=True)
@@ -132,7 +137,7 @@ def main():
     # ---------------------------------------------------------------- 4. reuse (regeneration is a separate job)
     reused, reuse_info = FP.load_or_build_field(raw_env, exact, qpos, start["ready_qpos"], region, pconfig, thresholds, exclude,
                                                 manifest_sha, allow_build=False)
-    plan_reuse = FP.plan_path(reused, exact, qpos, base_position[:2], base_yaw, start["base_xy"], start["base_yaw"], pconfig)
+    plan_reuse = FP.plan_path(reused, exact, qpos, start_axis, base_yaw, goal_axis, start["base_yaw"], pconfig)
     same = lambda p, q: p.get("cells") == q.get("cells") and p.get("waypoints") == q.get("waypoints")
     report["reuse"] = {"reuse": reuse_info, "reuse_path_identical": same(plan, plan_reuse)}
     print("reuse", {"reuse_path_identical": report["reuse"]["reuse_path_identical"], "load_seconds": reuse_info.get("load_seconds")}, flush=True)
@@ -149,7 +154,8 @@ def main():
             print("smoke plan", json.dumps(smoke[-1]), flush=True)
             continue
         pos, yaw = SU.base_pose(env_)
-        p = FP.plan_path(fld, ex, q, pos[:2], yaw, s["base_xy"], s["base_yaw"], pconfig)
+        p = FP.plan_path(fld, ex, q, FP.axis_from_site(pos[:2], yaw, offset), yaw,
+                         FP.axis_from_site(s["base_xy"], s["base_yaw"], offset), s["base_yaw"], pconfig)
         smoke.append({"episode": f"episode_{index:03d}", "cache": info["cache"], **{k: p.get(k) for k in (
             "status", "reason", "path_length_m", "num_waypoints", "min_cached_margin", "exact_min_margin", "expanded_nodes",
             "planning_seconds", "verification_seconds", "exact_evaluations")}, "discrepancies": len(p.get("cache_discrepancies", []))})
@@ -167,7 +173,7 @@ def main():
                                          ("best margin over all yaws", np.nanmax(field["node"], axis=2)))):
         im = ax.imshow(image.T, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], cmap="RdYlGn", vmin=-0.1, vmax=0.3)
         ax.contour(xs, ys, image.T, levels=[pconfig.buffer], colors="k", linewidths=0.8)
-        ax.plot([p[0][0] for p in old], [p[0][1] for p in old], "m--", lw=2, label=f"old straight path (min exact margin {old_min:.3f} m)")
+        ax.plot([FP.axis_from_site(p[0], p[1], offset)[0] for p in old], [FP.axis_from_site(p[0], p[1], offset)[1] for p in old], "m--", lw=2, label=f"old straight path (min exact margin {old_min:.3f} m)")
         wx = [w["xy"][0] for w in plan["waypoints"]]
         wy = [w["xy"][1] for w in plan["waypoints"]]
         ax.plot(wx, wy, "b-", lw=2.5, label=f"v3 plan (exact min margin {plan['exact_min_margin']:.3f} m)")
@@ -176,14 +182,14 @@ def main():
         for c in cells[::4]:
             xy, h = FP.cell_pose(field, c)
             ax.annotate(f"{field['node'][tuple(c)]:.2f}", xy, fontsize=6, color="k")
-        ax.plot(*base_position[:2], "ko", ms=8)
-        ax.plot(*start["base_xy"], "k*", ms=12)
+        ax.plot(*start_axis, "ko", ms=8)
+        ax.plot(*goal_axis, "k*", ms=12)
         ax.set_title(title)
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
         ax.legend(loc="upper left", fontsize=8)
         fig.colorbar(im, ax=ax, shrink=0.8)
-    fig.suptitle("episode_047: start (dot), goal (star); black contour = 4 cm buffer; numbers = cached node margins on the path")
+    fig.suptitle("episode_047 (yaw-axis coordinates): start (dot), goal (star); black contour = 4 cm buffer; numbers = cached node margins")
     fig.tight_layout()
     figure = os.path.join(args.output, "episode_047_plan_floorplan.png")
     fig.savefig(figure, dpi=110)

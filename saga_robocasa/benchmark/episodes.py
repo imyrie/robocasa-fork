@@ -46,7 +46,7 @@ BENCHMARK_VERSION = "counter_to_sink_v1"
 # (footprint_planner.py) with explicit rotate/translate tracking and an exact runtime safety layer;
 # the v2 local filter is not used. expert_v2 remains selectable for comparisons.
 EXPERT_VERSION = "expert_v3"
-EXPERT_STATUS = "provisional: uncalibrated base-dynamics coefficients, not yet validated in simulation"
+EXPERT_STATUS = "calibrated, not validated: base-dynamics coefficients from calibration job 679746; not yet validated in simulation"
 MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifests", "counter_to_sink_v1.json")
 
 

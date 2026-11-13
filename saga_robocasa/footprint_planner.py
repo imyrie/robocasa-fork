@@ -6,7 +6,13 @@ site, but Spot's collision geometry (body with legs) spans x -0.64..+0.03 m, y -
 that site and the arm extends further. On episode_047 the resulting straight path is infeasible at
 every heading (margin -0.11 to -0.19 m) although a collision-free detour exists.
 
-Margin of a pose (x, y, yaw of the base centre site; arm at the benchmark ready pose):
+Pose parameterization (v2 of this module): lattice and plan poses are (x, y, yaw) of the YAW-AXIS point,
+not of the base centre site. Expert v3 rotates with the yaw joint only (slide joints exactly zero),
+which keeps the yaw-axis point fixed and moves the site on an arc; so in-place lattice rotations are
+physically executable. site = axis + R(yaw) @ AXIS_TO_SITE_OFFSET (spot_utils.BaseActionModel offset,
+calibrated; joint-only rotation measured to follow this arc within ~0.01 m/s).
+
+Margin of a pose (arm at the benchmark ready pose):
     min over robot parts (base incl. legs, arm, gripper) of exact narrow-phase distance to the static
     scene minus that part's navigation abort threshold (base 0.04 m, arm 0.03 m, gripper 0.003 m).
 A node or edge is admissible when its margin is >= buffer (0.04 m): the existing abort thresholds plus
@@ -42,7 +48,8 @@ import numpy as np
 import spot_utils as SU
 
 CACHE_SCHEMA = "footprint_margin_field_v1"
-CODE_VERSION = "footprint_planner_v1"
+CODE_VERSION = "footprint_planner_v2_yaw_axis_poses"
+POSE_PARAMETERIZATION = "yaw_axis_point"
 CACHE_DIR = "/common/users/im484/saga_benchmark/cache/footprint_margin"
 
 
@@ -65,19 +72,39 @@ class PlannerConfig:
 # --------------------------------------------------------------------------- exact margin
 
 
-class ExactMargin:
-    """Exact pose margin on a scratch MjData (wraps nav_expert.FootprintPredictor)."""
+def axis_offset():
+    """Yaw-axis -> base-centre-site offset in the base frame (calibrated BaseActionModel value)."""
+    return np.asarray(SU.BaseActionModel().offset, dtype=float)
 
-    def __init__(self, raw_env, thresholds, exclude):
+
+def _rotate(yaw, vector):
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.array([c * vector[0] - s * vector[1], s * vector[0] + c * vector[1]])
+
+
+def site_from_axis(axis_xy, yaw, offset):
+    return np.asarray(axis_xy, dtype=float)[:2] + _rotate(yaw, offset)
+
+
+def axis_from_site(site_xy, yaw, offset):
+    return np.asarray(site_xy, dtype=float)[:2] - _rotate(yaw, offset)
+
+
+class ExactMargin:
+    """Exact margin of a YAW-AXIS pose on a scratch MjData (wraps nav_expert.FootprintPredictor)."""
+
+    def __init__(self, raw_env, thresholds, exclude, offset=None):
         from nav_expert import FootprintPredictor
 
         self.predictor = FootprintPredictor(raw_env, exclude, thresholds)
+        self.offset = axis_offset() if offset is None else np.asarray(offset, dtype=float)
         self.count = 0
         self.seconds = 0.0
 
     def __call__(self, qpos, xy, yaw, cap):
+        """xy is the yaw-axis point; the predictor is posed by the corresponding base-centre site."""
         t = time.perf_counter()
-        self.predictor.set_pose(qpos, xy, yaw)
+        self.predictor.set_pose(qpos, site_from_axis(xy, yaw, self.offset), yaw)
         margin, where = self.predictor.margin(cap=cap)
         self.count += 1
         self.seconds += time.perf_counter() - t
@@ -120,15 +147,24 @@ def cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, m
     live = raw_env.sim.data._data
     scene_hash = _sha(model.geom_type[scene], model.geom_size[scene], model.geom_dataid[scene],
                       live.geom_xpos[scene], live.geom_xmat[scene])
-    key = {"schema": CACHE_SCHEMA, "code_version": CODE_VERSION,
-           "layout_style": [int(raw_env.layout_id), int(raw_env.style_id)],
+    key = {"layout_style": [int(raw_env.layout_id), int(raw_env.style_id)],
            "static_scene_sha256": scene_hash, "robot_geometry_with_ready_arm_sha256": robot_hash,
-           "ready_arm_qpos": np.round(ready_qpos, 4).tolist(), "region": region,
-           "resolution": config.resolution, "yaw_resolution": config.yaw_resolution, "buffer": config.buffer,
-           "field_cap": config.field_cap, "thresholds": thresholds,
-           "excluded_geoms": sorted(int(g) for g in exclude), "manifest_sha256": manifest_sha256}
-    key_sha = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
-    return key, key_sha
+           "ready_arm_qpos": np.round(ready_qpos, 4).tolist(),
+           **static_key_fields(region, config, thresholds, exclude, manifest_sha256, exact.offset)}
+    return key, key_sha256(key)
+
+
+def static_key_fields(region, config, thresholds, exclude, manifest_sha256, offset):
+    """Cache-key fields that do not need the simulator (code version, parameterization, grid, margins)."""
+    return {"schema": CACHE_SCHEMA, "code_version": CODE_VERSION, "pose_parameterization": POSE_PARAMETERIZATION,
+            "axis_to_site_offset": np.round(np.asarray(offset, dtype=float), 6).tolist(), "region": region,
+            "resolution": config.resolution, "yaw_resolution": config.yaw_resolution, "buffer": config.buffer,
+            "field_cap": config.field_cap, "thresholds": thresholds,
+            "excluded_geoms": sorted(int(g) for g in exclude), "manifest_sha256": manifest_sha256}
+
+
+def key_sha256(key):
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
 
 
 # --------------------------------------------------------------------------- field construction
@@ -536,6 +572,7 @@ def compress(cells):
 def plan_path(field, exact, qpos, start_xy, start_yaw, goal_xy, goal_yaw, config, blocked=None):
     """
     Full planning: snap start/goal to admissible nodes with exact connections, A*, compress, exact re-check.
+    All poses (start, goal, waypoints) are YAW-AXIS poses; convert with axis_from_site / site_from_axis.
     Returns dict with status 'ok' or 'navigation_infeasible' (+ reason) and statistics.
     """
     t0 = time.perf_counter()
@@ -658,10 +695,14 @@ def plan_path(field, exact, qpos, start_xy, start_yaw, goal_xy, goal_yaw, config
 # --------------------------------------------------------------------------- benchmark helpers
 
 
-def benchmark_region(manifest, padding=0.5, yaw_padding=0.3):
-    starts = np.array([e["initial_base"]["xy"] for e in manifest["episodes"]])
-    goals = np.array([e["pregrasp"]["xy"] for e in manifest["episodes"]])
-    pts = np.vstack([starts, goals])
+def benchmark_region(manifest, padding=0.5, yaw_padding=0.3, offset=None):
+    """Lattice region over the YAW-AXIS points of every manifest start and pregrasp goal, padded."""
+    offset = axis_offset() if offset is None else np.asarray(offset, dtype=float)
+    pts = []
+    for e in manifest["episodes"]:
+        pts.append(axis_from_site(e["initial_base"]["xy"], e["initial_base"]["yaw"], offset))
+        pts.append(axis_from_site(e["pregrasp"]["xy"], e["pregrasp"]["yaw"], offset))
+    pts = np.array(pts)
     goal_yaw = float(manifest["episodes"][0]["pregrasp"]["yaw"])
     lo, hi = pts.min(axis=0) - padding, pts.max(axis=0) + padding
     return {"x": [round(float(lo[0]), 2), round(float(hi[0]), 2)], "y": [round(float(lo[1]), 2), round(float(hi[1]), 2)],

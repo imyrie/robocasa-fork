@@ -184,3 +184,43 @@ def test_compress_and_interpolate():
     assert len(samples) == 6 and np.allclose(samples[-1][0], [0.05, 0.0])
     rot = FP.interpolate((np.zeros(2), 0.0), (np.zeros(2), 0.1), config())
     assert len(rot) == 6 and abs(rot[-1][1] - 0.1) < 1e-12
+
+
+# --------------------------------------------------------------------------- yaw-axis parameterization and cache key
+
+
+def test_yaw_axis_site_conversion():
+    offset = FP.axis_offset()
+    assert np.allclose(offset, [0.2897088930558859, 0.030799061992560287])  # calibrated BaseActionModel offset
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        site, yaw = rng.uniform(-3, 3, 2), rng.uniform(-np.pi, np.pi)
+        axis = FP.axis_from_site(site, yaw, offset)
+        assert np.allclose(FP.site_from_axis(axis, yaw, offset), site, atol=1e-12)
+        assert abs(np.linalg.norm(site - axis) - np.linalg.norm(offset)) < 1e-12
+    # at yaw 0 the site is the axis plus the base-frame offset; at yaw pi/2 the offset is rotated
+    assert np.allclose(FP.site_from_axis([0, 0], 0.0, offset), offset)
+    assert np.allclose(FP.site_from_axis([0, 0], np.pi / 2, offset), [-offset[1], offset[0]])
+
+
+def test_cache_key_changes_with_code_version_parameterization_offset_and_manifest(monkeypatch):
+    cfg = config()
+    base = FP.static_key_fields(REGION, cfg, {"base": 0.04}, {1, 2}, "m" * 64, FP.axis_offset())
+    assert base["code_version"] == "footprint_planner_v2_yaw_axis_poses" and base["pose_parameterization"] == "yaw_axis_point"
+    sha = FP.key_sha256(base)
+    assert FP.key_sha256(FP.static_key_fields(REGION, cfg, {"base": 0.04}, {1, 2}, "x" * 64, FP.axis_offset())) != sha
+    assert FP.key_sha256(FP.static_key_fields(REGION, cfg, {"base": 0.04}, {1, 2}, "m" * 64, FP.axis_offset() + 0.01)) != sha
+    monkeypatch.setattr(FP, "CODE_VERSION", "footprint_planner_v1")
+    assert FP.key_sha256(FP.static_key_fields(REGION, cfg, {"base": 0.04}, {1, 2}, "m" * 64, FP.axis_offset())) != sha
+
+
+def test_benchmark_region_covers_yaw_axis_points():
+    manifest = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "manifests",
+                                           "counter_to_sink_v1.json")))
+    region = FP.benchmark_region(manifest)
+    offset = FP.axis_offset()
+    for e in manifest["episodes"]:
+        for xy, yaw in ((e["initial_base"]["xy"], e["initial_base"]["yaw"]), (e["pregrasp"]["xy"], e["pregrasp"]["yaw"])):
+            axis = FP.axis_from_site(xy, yaw, offset)
+            assert region["x"][0] + 0.45 <= axis[0] <= region["x"][1] - 0.45
+            assert region["y"][0] + 0.45 <= axis[1] <= region["y"][1] - 0.45

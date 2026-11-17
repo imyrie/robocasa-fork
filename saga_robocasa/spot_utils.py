@@ -630,9 +630,15 @@ class BaseActionModel:
     def _site_offset_velocity(self, omega, base_yaw):
         return omega * (self._rotation(base_yaw) @ np.array([-self.offset[1], self.offset[0]]))
 
-    def base_velocity(self, base_motion, base_yaw):
-        """base_motion[0:3] -> [forward, side, yaw_rate] of the base centre site in the base frame (steady state)."""
+    def base_velocity(self, base_motion, base_yaw, controller_frame=None):
+        """
+        base_motion[0:3] -> [forward, side, yaw_rate] of the base centre site in the base frame (steady state).
+        controller_frame (opt-in, see base_controller_frame): first apply robosuite's own rotation of the base
+        action, so the deadband model acts on the joint commands the controller actually issues.
+        """
         u = np.asarray(base_motion, dtype=np.float64)[:3]
+        if controller_frame is not None:
+            u = robosuite_base_goal(u, controller_frame)
         joint_anchor = np.array([self._response(u[1], self.translation_gain, self.translation_deadband),
                                  self._response(u[0], self.translation_gain, self.translation_deadband)])
         omega = float(self._response(u[2], self.yaw_gain, self.yaw_deadband))
@@ -641,7 +647,7 @@ class BaseActionModel:
         return np.array([forward_side[0], forward_side[1], omega])
 
     def base_motion(self, forward, side, yaw_rate, base_yaw, minimum_speed=0.003, minimum_yaw_rate=0.003,
-                    compensate_yaw_offset=True):
+                    compensate_yaw_offset=True, controller_frame=None):
         """
         Inverse with deadband compensation: base-frame site velocity and yaw rate -> base_motion[0:3].
 
@@ -653,7 +659,25 @@ class BaseActionModel:
         point and the slides receive only that translation, so a pure rotation commands the slide joints
         with exactly zero and the site moves on the modelled arc about the yaw axis (measured agreement
         ~0.01 m/s).
+
+        controller_frame=None (default, all earlier experts and replays): the result is returned as is,
+        i.e. it is assumed to reach the slide joints unchanged. That holds only while the base yaw equals
+        the yaw at the last controller reset: robosuite's MobileBaseJointVelocityController.set_goal
+        rotates base action[0:2] by theta = current yaw - reset yaw before it becomes the joint velocity
+        goal (measured, 2026-11-16 trace: rotation = theta to numerical precision, gain 1).
+        controller_frame=dict from base_controller_frame() (opt-in, expert v3): the friction-compensated
+        commands above are the intended JOINT commands; the returned action is pre-rotated with the inverse
+        of robosuite's rotation so that, after set_goal, the slide joints receive exactly those commands.
         """
+        joint = self.joint_commands(forward, side, yaw_rate, base_yaw, minimum_speed, minimum_yaw_rate,
+                                    compensate_yaw_offset)
+        if controller_frame is None:
+            return joint
+        return controller_pre_rotation(joint, controller_frame)
+
+    def joint_commands(self, forward, side, yaw_rate, base_yaw, minimum_speed=0.003, minimum_yaw_rate=0.003,
+                       compensate_yaw_offset=True):
+        """Friction-compensated slide/yaw joint commands [anchor-y slide, anchor-x slide, yaw] (see base_motion)."""
         omega = 0.0 if abs(yaw_rate) < minimum_yaw_rate else yaw_rate
         site_world = self._rotation(base_yaw) @ np.array([forward, side])
         offset_velocity = self._site_offset_velocity(omega, base_yaw) if compensate_yaw_offset else np.zeros(2)
@@ -663,6 +687,111 @@ class BaseActionModel:
             self._command(joint_anchor[0], self.translation_gain, self.translation_deadband, minimum_speed),
             self._command(omega, self.yaw_gain, self.yaw_deadband, minimum_yaw_rate),
         ])
+
+
+# --------------------------------------------------------------------------- robosuite base-controller frame
+
+BASE_CONTROLLER_CONVENTIONS = ("standard", "legacy", "legacy_reversed")
+
+
+def _robosuite_goal_matrix(frame):
+    """
+    The linear map robosuite's base set_goal applies to action[0:2] (goal_qvel[0:2] = M @ action[0:2]),
+    copied from robosuite/controllers/parts/mobile_base/joint_vel.py:
+      MobileBaseJointVelocityController ("standard"):
+          g0 = x cos(theta) + y sin(theta);  g1 = -x sin(theta) + y cos(theta)
+      LegacyMobileBaseJointVelocityController, forward joint axis = y ("legacy_reversed"): action reordered
+          [1, 0, 2] first, then the standard formula;
+      LegacyMobileBaseJointVelocityController otherwise ("legacy"):
+          g0 = x cos(theta) - y sin(theta);  g1 = x sin(theta) + y cos(theta)
+    theta = mat2euler(current centre-site orientation)[2] - mat2euler(init_ori)[2], unwrapped (as robosuite).
+    robosuite's mat2euler returns float32, so theta and cos/sin are float32 there; frame["theta"] keeps that
+    exact value (base_controller_frame) and cos/sin are taken in the same precision, then promoted.
+    """
+    theta, convention = frame["theta"], frame["convention"]
+    c, s = float(np.cos(theta)), float(np.sin(theta))
+    if convention == "standard":
+        return np.array([[c, s], [-s, c]])
+    if convention == "legacy_reversed":
+        return np.array([[c, s], [-s, c]]) @ np.array([[0.0, 1.0], [1.0, 0.0]])
+    if convention == "legacy":
+        return np.array([[c, -s], [s, c]])
+    raise ValueError(f"unknown base controller convention {convention!r}")
+
+
+def robosuite_base_goal(action, frame):
+    """Joint velocity goal robosuite's base controller produces from base action[0:3] (yaw unchanged)."""
+    action = np.asarray(action, dtype=np.float64)
+    goal = action.copy()
+    goal[:2] = _robosuite_goal_matrix(frame) @ action[:2]
+    return goal
+
+
+def controller_pre_rotation(joint, frame):
+    """
+    Inverse of robosuite_base_goal: the base action whose controller goal equals the intended joint commands.
+    The map is a rotation (or rotation x swap); it is inverted with a linear solve of the same matrix, so the
+    float32 cos/sin robosuite uses do not leave an orthogonality residue. Inactive joints stay inactive: a
+    zero translation request returns exact zeros (no rotation is applied to it).
+    """
+    joint = np.asarray(joint, dtype=np.float64)
+    action = joint.copy()
+    if joint[0] == 0.0 and joint[1] == 0.0:
+        action[:2] = 0.0
+        return action
+    action[:2] = np.linalg.solve(_robosuite_goal_matrix(frame), joint[:2])
+    return action
+
+
+def base_controller(raw_env):
+    return raw_env.robots[0].composite_controller.part_controllers["base"]
+
+
+def base_controller_frame(raw_env):
+    """
+    The exact reference robosuite's base controller will use at the next set_goal: its class/convention,
+    the reset orientation it stored (controller.init_ori, set in reset_goal), the current orientation of
+    the same site it reads (controller.get_base_pose(), site <prefix>center) and theta with robosuite's
+    convention (difference of mat2euler z angles, unwrapped). Read live every step, never inferred from
+    the episode start pose.
+    """
+    import robosuite.utils.transform_utils as T
+    from robosuite.controllers.parts.mobile_base.joint_vel import (LegacyMobileBaseJointVelocityController,
+                                                                    MobileBaseJointVelocityController)
+
+    controller = base_controller(raw_env)
+    if isinstance(controller, LegacyMobileBaseJointVelocityController):
+        convention = "legacy_reversed" if controller._check_forward_joint_reversed() else "legacy"
+    elif type(controller) is MobileBaseJointVelocityController:
+        convention = "standard"
+    else:
+        raise TypeError(f"unsupported base controller {type(controller).__name__}")
+    _, current = controller.get_base_pose()
+    reset_yaw = T.mat2euler(controller.init_ori)[2]
+    current_yaw = T.mat2euler(current)[2]
+    return {"controller": type(controller).__name__, "convention": convention, "reset_yaw": float(reset_yaw),
+            "current_yaw": float(current_yaw), "theta": current_yaw - reset_yaw}   # theta: robosuite's float32 value
+
+
+def check_base_controller(raw_env):
+    """
+    Preconditions of the controller-frame action mode, checked against the live controller: fixed impedance
+    mode, no interpolator, symmetric +/-1 actuator range (run_controller's bias 0 / weight 1, so the goal is
+    the actuator ctrl), and joint order [forward, side, yaw]. Returns a report; raises if any fails.
+    """
+    controller = base_controller(raw_env)
+    low, high = np.asarray(controller.actuator_min, float), np.asarray(controller.actuator_max, float)
+    report = {"controller": type(controller).__name__, "impedance_mode": controller.impedance_mode,
+              "interpolator": None if controller.interpolator is None else type(controller.interpolator).__name__,
+              "actuator_min": low.tolist(), "actuator_max": high.tolist(), "joint_names": list(controller.joint_names)}
+    ok = (controller.impedance_mode == "fixed" and controller.interpolator is None
+          and np.allclose(low, -1.0) and np.allclose(high, 1.0) and len(controller.joint_names) == 3
+          and "forward" in controller.joint_names[0] and "side" in controller.joint_names[1]
+          and "yaw" in controller.joint_names[2])
+    report["ok"] = bool(ok)
+    if not ok:
+        raise RuntimeError(f"base controller does not satisfy the controller-frame preconditions: {report}")
+    return report
 
 
 # --------------------------------------------------------------------------- policy action conversion

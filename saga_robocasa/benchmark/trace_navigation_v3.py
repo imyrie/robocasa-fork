@@ -53,9 +53,14 @@ class TraceRecorder:
                             decision="selected" if admissible else "rejected->exact stop",
                             predicted_margin=float(margin), predicted_nearest=nearest)
 
-    def on_action(self, base_velocity, base_motion):
+    def on_action(self, base_velocity, base_motion, frame=None, intended_joint=None, expected_goal=None):
         self.pending.update(base_action_model_input=None if base_velocity is None else list(map(float, base_velocity)),
                             final_base_motion=list(map(float, base_motion)))
+        if frame is not None:
+            self.pending.update(controller_frame={k: (float(v) if k in ("reset_yaw", "current_yaw", "theta") else v)
+                                                  for k, v in frame.items()},
+                                intended_joint_commands=None if intended_joint is None else list(map(float, intended_joint)),
+                                expected_controller_goal=list(map(float, expected_goal)))
 
     def take(self):
         record, self.pending = self.pending, {}
@@ -83,8 +88,17 @@ def install(recorder=RECORDER):
         return command
 
     def action(self, command):
+        velocity = getattr(command, "base_velocity", None)
+        frame = SU.base_controller_frame(self.raw_env) if velocity is not None else None   # read-only
         result = original_action(self, command)
-        recorder.on_action(getattr(command, "base_velocity", None), result["action.base_motion"][:3])
+        intended = expected = None
+        if velocity is not None:
+            _, yaw = SU.base_pose(self.raw_env)
+            intended = self.base_model.joint_commands(velocity[0], velocity[1], velocity[2], yaw,
+                                                      compensate_yaw_offset=self.v3 is None)
+            # what robosuite's set_goal will make of the exact (clipped, float32) action sent
+            expected = SU.robosuite_base_goal(result["action.base_motion"][:3], frame)
+        recorder.on_action(velocity, result["action.base_motion"][:3], frame, intended, expected)
         return result
 
     def _v3_translate(self, p0, p1, index, *args, **kwargs):
@@ -121,8 +135,9 @@ def track_errors(segment, point):
     return float(length - np.dot(rel, u)), float(u[0] * rel[1] - u[1] * rel[0])  # remaining along, signed cross
 
 
-def trace_episode(bench, entry, max_steps, exact_every):
+def trace_episode(bench, entry, max_steps, exact_every, base_action_frame="anchor"):
     install()
+    bench.nav_config.v3_base_action_frame = base_action_frame
     recorder = RECORDER
     recorder.pending, recorder.segment = {}, None
     start, nav_plan, report = bench.reset_to_spec(params_from_entry(entry))
@@ -157,6 +172,7 @@ def trace_episode(bench, entry, max_steps, exact_every):
                           measured_yaw_rate=float(np.angle(np.exp(1j * (yaw1 - yaw0)))) / 0.05,
                           along_track_remaining=remaining, cross_track_error=cross, cached_margin_current=cached,
                           base_ctrl=[float(data.ctrl[a]) for a in actuators],
+                          actual_controller_goal=[float(v) for v in np.asarray(SU.base_controller(raw_env).goal_qvel)],
                           base_joint_qpos={s: float(data.qpos[model.jnt_qposadr[j]]) for s, j in joints.items()},
                           base_joint_qvel={s: float(data.qvel[model.jnt_dofadr[j]]) for s, j in joints.items()},
                           mode=command.info.get("v3_mode", record.get("mode")))
@@ -180,6 +196,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--exact-every", type=int, default=5)
     parser.add_argument("--compare-audit", default=None, help="audit directory with the saved trajectory of the same run")
+    parser.add_argument("--base-action-frame", choices=["anchor", "controller"], default="anchor",
+                        help="NavConfig.v3_base_action_frame for the traced run (anchor = the configuration of job 1303312)")
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
     manifest = json.load(open(os.path.join(ROOT, "benchmark", "manifests", "counter_to_sink_v1.json")))
@@ -187,7 +205,8 @@ def main():
     for spec in args.episodes:
         index, max_steps = (int(x) for x in spec.split(":"))
         t = time.time()
-        result = trace_episode(bench, manifest["episodes"][index], max_steps, args.exact_every)
+        result = trace_episode(bench, manifest["episodes"][index], max_steps, args.exact_every, args.base_action_frame)
+        result["base_action_frame"] = args.base_action_frame
         result.update(seconds=time.time() - t, commit=git_commit(), **host_info())
         if args.compare_audit:
             saved = json.load(open(os.path.join(args.compare_audit, f"{result['episode_id']}.json")))["navigation_tracking"]

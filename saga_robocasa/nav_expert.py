@@ -122,6 +122,12 @@ class NavConfig:
     # Re-analysis: calibrate_base_dynamics.py --refit-from (calibration_refit_by_segment_type.json).
     v3_response_xy: float = 0.370
     v3_response_yaw: float = 0.139
+    # Base action frame. "anchor" (default, every earlier expert/replay): BaseActionModel output is sent as
+    # is, which is correct only while the base yaw equals the yaw at the last base-controller reset.
+    # "controller" (opt-in): the friction-compensated joint commands are pre-rotated by the inverse of
+    # robosuite's base set_goal rotation (theta = current yaw - controller reset yaw, read live; see
+    # spot_utils.base_controller_frame), so the slide joints receive the intended commands at any heading.
+    v3_base_action_frame: str = "anchor"
 
 
 @dataclass
@@ -405,9 +411,13 @@ class NavExpertFSM(ExpertFSM):
         velocity = getattr(command, "base_velocity", None)
         if velocity is not None:
             _, base_yaw = SU.base_pose(self.raw_env)
+            frame = None
+            if self.v3 is not None and self.nav_config.v3_base_action_frame == "controller":
+                frame = SU.base_controller_frame(self.raw_env)
+                self.v3["last_action_frame"] = frame
             action["action.base_motion"][:3] = np.clip(
                 self.base_model.base_motion(velocity[0], velocity[1], velocity[2], base_yaw,
-                                            compensate_yaw_offset=self.v3 is None), -1.0, 1.0
+                                            compensate_yaw_offset=self.v3 is None, controller_frame=frame), -1.0, 1.0
             ).astype(np.float32)
         return action
 
@@ -532,6 +542,10 @@ class NavExpertFSM(ExpertFSM):
                                               allow_build=False,
                                               cache_dir=nav.lattice_cache_dir)
         cache["load_or_build_seconds"] = time.perf_counter() - t
+        if nav.v3_base_action_frame == "controller":
+            self.events.append(("NAV_BASE_CONTROLLER", SU.check_base_controller(self.raw_env)))
+        elif nav.v3_base_action_frame != "anchor":
+            raise ValueError(f"unknown v3_base_action_frame {nav.v3_base_action_frame!r}")
         base_position, base_yaw = SU.base_pose(self.raw_env)
         # plan in yaw-axis coordinates (in-place rotations keep the yaw-axis point fixed)
         start_axis = FP.axis_from_site(base_position[:2], base_yaw, offset)

@@ -776,8 +776,10 @@ def base_controller_frame(raw_env):
 def check_base_controller(raw_env):
     """
     Preconditions of the controller-frame action mode, checked against the live controller: fixed impedance
-    mode, no interpolator, symmetric +/-1 actuator range (run_controller's bias 0 / weight 1, so the goal is
-    the actuator ctrl), and joint order [forward, side, yaw]. Returns a report; raises if any fails.
+    mode, no interpolator, joint order [forward, side, yaw], slide actuators exactly +/-1 (run_controller's
+    bias 0 / weight 1, so the rotated goal[0:2] IS the slide ctrl) and a symmetric yaw actuator range (bias 0;
+    its weight, 1.5 for Spot, scales goal[2] only, is not involved in the rotation and is part of the
+    calibrated yaw gain 1.502). Returns a report; raises if any fails.
     """
     controller = base_controller(raw_env)
     low, high = np.asarray(controller.actuator_min, float), np.asarray(controller.actuator_max, float)
@@ -785,7 +787,8 @@ def check_base_controller(raw_env):
               "interpolator": None if controller.interpolator is None else type(controller.interpolator).__name__,
               "actuator_min": low.tolist(), "actuator_max": high.tolist(), "joint_names": list(controller.joint_names)}
     ok = (controller.impedance_mode == "fixed" and controller.interpolator is None
-          and np.allclose(low, -1.0) and np.allclose(high, 1.0) and len(controller.joint_names) == 3
+          and len(low) == 3 and np.allclose(low[:2], -1.0) and np.allclose(high[:2], 1.0) and np.isclose(low[2], -high[2])
+          and high[2] > 0 and len(controller.joint_names) == 3
           and "forward" in controller.joint_names[0] and "side" in controller.joint_names[1]
           and "yaw" in controller.joint_names[2])
     report["ok"] = bool(ok)

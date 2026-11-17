@@ -162,3 +162,24 @@ def test_trace_measured_rotation_matches_the_standard_convention():
 def test_unknown_convention_rejected():
     with pytest.raises(ValueError):
         SU.robosuite_base_goal([0.1, 0.0, 0.0], {"convention": "other", "theta": 0.0})
+
+
+def _fake_env(low, high, names=("leg0_joint_mobile_forward", "leg0_joint_mobile_side", "leg0_joint_mobile_yaw"),
+              interpolator=None, mode="fixed"):
+    from types import SimpleNamespace as NS
+
+    ctrl = NS(actuator_min=np.array(low), actuator_max=np.array(high), joint_names=list(names),
+              interpolator=interpolator, impedance_mode=mode)
+    return NS(robots=[NS(composite_controller=NS(part_controllers={"base": ctrl}))])
+
+
+def test_check_base_controller_preconditions():
+    # Spot as measured (job 1304249): slides +/-1, yaw +/-1.5
+    assert SU.check_base_controller(_fake_env([-1, -1, -1.5], [1, 1, 1.5]))["ok"]
+    for bad in [_fake_env([-1, -0.5, -1.5], [1, 0.5, 1.5]),            # slide weight != 1
+                _fake_env([-1, -1, -1.0], [1, 1, 1.5]),                # asymmetric yaw (bias != 0)
+                _fake_env([-1, -1, -1.5], [1, 1, 1.5], names=("a_side", "a_forward", "a_yaw")),
+                _fake_env([-1, -1, -1.5], [1, 1, 1.5], interpolator=object()),
+                _fake_env([-1, -1, -1.5], [1, 1, 1.5], mode="variable")]:
+        with pytest.raises(RuntimeError):
+            SU.check_base_controller(bad)

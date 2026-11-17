@@ -47,7 +47,8 @@ import numpy as np
 
 import spot_utils as SU
 
-CACHE_SCHEMA = "footprint_margin_field_v2"  # v2: continuous geometry checked against a stored reference with tolerances
+CACHE_SCHEMA = "footprint_margin_field_v3"  # v3: canonical exclusion (only geoms that could enter the margin scene)
+PREVIOUS_CACHE_SCHEMA = "footprint_margin_field_v2"  # v2 keyed the caller's raw exclusion list (incl. non-collidable geoms)
 LEGACY_CACHE_SCHEMA = "footprint_margin_field_v1"  # v1 hashed continuous geometry rounded to 1e-6 (see cache_key_v1)
 # Continuous geometry tolerances for reusing a margin map. Observed reset-to-reset noise over the ten smoke
 # episodes: hinged cabinet doors settle by <= 3.0e-5 m / 2.2e-4 (rotation-matrix entries), ready arm pose
@@ -169,17 +170,32 @@ def cache_geometry(raw_env, exact, ready_qpos):
     return discrete, continuous
 
 
+def scene_eligible_geoms(model):
+    """
+    Geoms that can enter the margin scene: exactly the rule of nav_expert.FootprintPredictor (collidable,
+    not owned by the robot, not the floor). Only these can change margins when excluded or included.
+    """
+    return {int(g) for g in SU.collidable(model)
+            if SU.geom_owner(model, g) is None and "floor" not in SU.geom_name(model, g).lower()}
+
+
+def canonical_exclusion(exclude, eligible):
+    """The part of a caller's exclusion set that can affect the margin scene (non-collidable geoms drop out)."""
+    return sorted(int(g) for g in set(int(g) for g in exclude) & set(eligible))
+
+
 def cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256):
     """
-    Returns (key, key_sha256, geometry). The key hashes only discrete/configuration identity (geom sets,
-    types, sizes, meshes, layout, code version, parameterization, region, grid, margins, thresholds,
-    exclusions, manifest); continuous geometry is returned separately and compared with
-    GEOMETRY_TOLERANCES against the reference stored with the cache (verify_complete_cache).
+    Returns (key, key_sha256, geometry). The key hashes only discrete/configuration identity (effective
+    scene and robot geom sets, types, sizes, meshes, layout, code version, parameterization, region, grid,
+    margins, thresholds, CANONICAL exclusion, manifest); continuous geometry is returned separately and
+    compared with GEOMETRY_TOLERANCES against the reference stored with the cache (verify_complete_cache).
     """
     discrete, geometry = cache_geometry(raw_env, exact, ready_qpos)
+    excluded = canonical_exclusion(exclude, scene_eligible_geoms(raw_env.sim.model._model))
     key = {"layout_style": [int(raw_env.layout_id), int(raw_env.style_id)], **discrete,
            "geometry_tolerances": GEOMETRY_TOLERANCES,
-           **static_key_fields(region, config, thresholds, exclude, manifest_sha256, exact.offset)}
+           **static_key_fields(region, config, thresholds, excluded, manifest_sha256, exact.offset)}
     return key, key_sha256(key), geometry
 
 
@@ -193,7 +209,9 @@ def cache_key_v1(raw_env, exact, ready_qpos, region, config, thresholds, exclude
     key = {"layout_style": [int(raw_env.layout_id), int(raw_env.style_id)],
            "static_scene_sha256": scene_hash, "robot_geometry_with_ready_arm_sha256": robot_hash,
            "ready_arm_qpos": np.round(ready_qpos, 4).tolist(),
-           **static_key_fields(region, config, thresholds, exclude, manifest_sha256, exact.offset)}
+           **static_key_fields(region, config, thresholds, [], manifest_sha256, exact.offset)}
+    key.pop("excluded_scene_geoms")
+    key["excluded_geoms"] = sorted(int(g) for g in exclude)  # v1 keyed the raw exclusion list
     key["schema"] = LEGACY_CACHE_SCHEMA
     return key, key_sha256(key)
 
@@ -232,13 +250,16 @@ def load_geometry(path):
         return {k: archive[k] for k in archive.files}
 
 
-def static_key_fields(region, config, thresholds, exclude, manifest_sha256, offset):
-    """Cache-key fields that do not need the simulator (code version, parameterization, grid, margins)."""
+def static_key_fields(region, config, thresholds, excluded_scene_geoms, manifest_sha256, offset):
+    """
+    Cache-key fields that do not need the simulator (code version, parameterization, grid, margins).
+    `excluded_scene_geoms` must already be canonical (canonical_exclusion).
+    """
     return {"schema": CACHE_SCHEMA, "code_version": CODE_VERSION, "pose_parameterization": POSE_PARAMETERIZATION,
             "axis_to_site_offset": np.round(np.asarray(offset, dtype=float), 6).tolist(), "region": region,
             "resolution": config.resolution, "yaw_resolution": config.yaw_resolution, "buffer": config.buffer,
             "field_cap": config.field_cap, "thresholds": thresholds,
-            "excluded_geoms": sorted(int(g) for g in exclude), "manifest_sha256": manifest_sha256}
+            "excluded_scene_geoms": sorted(int(g) for g in excluded_scene_geoms), "manifest_sha256": manifest_sha256}
 
 
 def key_sha256(key):
@@ -585,6 +606,89 @@ def load_or_build_field(raw_env, exact, qpos, ready_qpos, region, config, thresh
                     "build_seconds": field["build_seconds"], "evaluations": field["evaluations"],
                     "slices_reused": field["slices_reused"], "slice_problems": field["slice_problems"],
                     "size_bytes": os.path.getsize(path), "arrays_sha256": checksum, "partial_dir": partial_dir}
+
+
+def migrate_cache_files(cache_dir, source_sha, dest_key, dest_sha, geometry, eligible, region, config, provenance):
+    """
+    Proof-before-copy re-key of a complete schema-v2 cache under the canonical (v3) key, without
+    recomputing it. Proofs, all before anything is written:
+      1. the source marker's stored key hashes to `source_sha` and is schema v2;
+      2. the source passes every completeness check (marker, configuration hash, manifest checksum,
+         slice count, npz and geometry-reference checksums, shapes, array checksum, no NaN), with the
+         current geometry within GEOMETRY_TOLERANCES of its reference;
+      3. every key field other than the schema and the exclusion field is identical (same effective
+         scene and robot geom sets, sizes, meshes, layout, code version, region, grid, margins,
+         thresholds, tolerances, manifest);
+      4. the canonical form of the source's raw exclusion equals the destination's canonical exclusion.
+    Then the arrays and the geometry reference are copied byte-for-byte, and the destination completion
+    marker is written last. The source files are left untouched. Raises RuntimeError on any failure.
+    """
+    import shutil
+
+    source_marker_path = os.path.join(cache_dir, f"{source_sha}.complete.json")
+    if not os.path.exists(source_marker_path):
+        raise RuntimeError(f"source cache {source_sha} has no completion marker")
+    source_marker = json.load(open(source_marker_path))
+    source_key = source_marker.get("key", {})
+    if key_sha256(source_key) != source_sha or source_marker.get("key_sha256") != source_sha:
+        raise RuntimeError("source marker key does not hash to the source key")
+    if source_key.get("schema") != PREVIOUS_CACHE_SCHEMA:
+        raise RuntimeError(f"source schema {source_key.get('schema')} is not {PREVIOUS_CACHE_SCHEMA}")
+    _, problems = verify_complete_cache(cache_dir, source_key, source_sha, region, config, geometry)
+    if problems:
+        raise RuntimeError(f"source cache failed completeness/geometry checks: {problems}")
+    ignored = {"schema", "excluded_geoms", "excluded_scene_geoms"}
+    differing = sorted(k for k in set(source_key) | set(dest_key) if k not in ignored and source_key.get(k) != dest_key.get(k))
+    if differing:
+        raise RuntimeError(f"source and destination keys differ beyond the exclusion field: {differing}")
+    if canonical_exclusion(source_key.get("excluded_geoms", []), eligible) != dest_key["excluded_scene_geoms"]:
+        raise RuntimeError("canonical exclusion of the source differs from the destination's")
+    dest_marker_path = os.path.join(cache_dir, f"{dest_sha}.complete.json")
+    if os.path.exists(dest_marker_path):
+        raise RuntimeError(f"destination cache {dest_sha} already exists; not overwriting")
+    for suffix in (".npz", ".geometry.npz"):
+        src, dst = os.path.join(cache_dir, source_sha + suffix), os.path.join(cache_dir, dest_sha + suffix)
+        shutil.copyfile(src, dst + ".tmp")
+        os.replace(dst + ".tmp", dst)
+        if file_sha256(dst) != file_sha256(src):
+            raise RuntimeError(f"byte copy of {suffix} differs")
+    dest_npz = os.path.join(cache_dir, f"{dest_sha}.npz")
+    marker = {**{k: source_marker[k] for k in ("arrays_sha256", "slices_expected", "slices_complete", "shape", "build_seconds",
+                                               "evaluations_this_run", "workers", "worker_memory") if k in source_marker},
+              "key": dest_key, "key_sha256": dest_sha, "manifest_sha256": dest_key["manifest_sha256"],
+              "npz_sha256": file_sha256(dest_npz), "geometry_sha256": file_sha256(os.path.join(cache_dir, f"{dest_sha}.geometry.npz")),
+              **provenance,
+              "migrated_from": {"key_sha256": source_sha, "schema": PREVIOUS_CACHE_SCHEMA,
+                                "source_code_commit": source_marker.get("code_commit"),
+                                "built_with_commit": (source_marker.get("migrated_from") or {}).get("built_with_commit",
+                                                                                                   source_marker.get("code_commit")),
+                                "source_migrated_from": source_marker.get("migrated_from"),
+                                "proof": "source complete and geometry within tolerance; all key fields identical except the "
+                                         "exclusion field; canonical exclusions equal; arrays and geometry reference copied byte-for-byte"}}
+    if marker["arrays_sha256"] != source_marker["arrays_sha256"]:
+        raise RuntimeError("arrays checksum changed")
+    _atomic_json(dest_marker_path, marker)  # written last
+    _, after = verify_complete_cache(cache_dir, dest_key, dest_sha, region, config, geometry)
+    if after:
+        raise RuntimeError(f"migrated cache failed completeness checks: {after}")
+    return {"source_key_sha256": source_sha, "key_sha256": dest_sha, "arrays_sha256": marker["arrays_sha256"],
+            "npz_sha256": marker["npz_sha256"], "geometry_sha256": marker["geometry_sha256"],
+            "built_with_commit": marker["migrated_from"]["built_with_commit"], "completion_checks": "passed"}
+
+
+def migrate_cache(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256, source_sha,
+                  cache_dir=CACHE_DIR):
+    """Simulator-side wrapper: computes the canonical destination key and current geometry, then migrates."""
+    import subprocess
+
+    dest_key, dest_sha, geometry = cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256)
+    repo = os.path.dirname(os.path.abspath(__file__))
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    dirty = bool(subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo, capture_output=True,
+                                text=True).stdout.strip())
+    return migrate_cache_files(cache_dir, source_sha, dest_key, dest_sha, geometry,
+                               scene_eligible_geoms(raw_env.sim.model._model), region, config,
+                               {"code_commit": commit, "code_dirty": dirty, "migration_commit": commit})
 
 
 def migrate_legacy_cache(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256, legacy_key_sha,

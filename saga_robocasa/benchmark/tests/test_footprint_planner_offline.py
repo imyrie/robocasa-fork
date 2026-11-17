@@ -256,4 +256,97 @@ def test_geometry_tolerance_comparison():
     arm = fake_geometry()
     arm["ready_qpos"][0] += 2e-4                       # above the 1e-4 rad tolerance
     assert any("ready_qpos" in p for p in FP.compare_geometry(reference, arm))
-    assert FP.CACHE_SCHEMA == "footprint_margin_field_v2" and FP.LEGACY_CACHE_SCHEMA == "footprint_margin_field_v1"
+    assert FP.CACHE_SCHEMA == "footprint_margin_field_v3" and FP.PREVIOUS_CACHE_SCHEMA == "footprint_margin_field_v2"
+    assert FP.LEGACY_CACHE_SCHEMA == "footprint_margin_field_v1"
+
+
+# --------------------------------------------------------------------------- canonical exclusion (schema v3) and migration
+
+ELIGIBLE = {10, 11, 12}          # collidable, non-robot, non-floor geoms that can enter the margin scene
+NONCOLLIDABLE_TARGET = {98, 99}  # e.g. the target object's visual-only geoms
+
+
+def _key(excluded, manifest="m" * 64, region=REGION, extra=None):
+    key = {"layout_style": [52, 13], "scene_geoms_sha256": "s" * 64, "scene_geom_sizes_sha256": "z" * 64,
+           "robot_geoms_sha256": "r" * 64, "robot_geom_sizes_sha256": "q" * 64, "geometry_tolerances": FP.GEOMETRY_TOLERANCES,
+           **FP.static_key_fields(region, config(), {"base": 0.04}, excluded, manifest, FP.axis_offset())}
+    key.update(extra or {})
+    return key
+
+
+def test_noncollidable_excluded_geoms_do_not_change_the_key():
+    a = FP.canonical_exclusion({10}, ELIGIBLE)
+    b = FP.canonical_exclusion({10} | NONCOLLIDABLE_TARGET, ELIGIBLE)
+    assert a == b == [10]
+    assert FP.key_sha256(_key(a)) == FP.key_sha256(_key(b))
+
+
+def test_collidable_excluded_geom_changes_the_key():
+    assert FP.key_sha256(_key(FP.canonical_exclusion({10}, ELIGIBLE))) != FP.key_sha256(_key(FP.canonical_exclusion({10, 11}, ELIGIBLE)))
+    assert FP.key_sha256(_key(FP.canonical_exclusion({10}, ELIGIBLE))) != FP.key_sha256(_key(FP.canonical_exclusion(set(), ELIGIBLE)))
+
+
+def test_all_target_geoms_and_collision_only_callers_share_a_key():
+    tools = {10} | NONCOLLIDABLE_TARGET   # tooling: every geom of the target object
+    expert = {10}                          # NavExpertFSM: object_collision_geoms
+    assert FP.key_sha256(_key(FP.canonical_exclusion(tools, ELIGIBLE))) == FP.key_sha256(_key(FP.canonical_exclusion(expert, ELIGIBLE)))
+
+
+def test_different_effective_scene_is_still_rejected():
+    assert FP.key_sha256(_key([10])) != FP.key_sha256(_key([10], extra={"scene_geoms_sha256": "t" * 64}))
+    moved = fake_geometry()
+    moved["scene_xpos"][0, 1] += 0.002
+    assert FP.compare_geometry(fake_geometry(), moved)
+
+
+def _write_v2_cache(tmp_path, raw_excluded):
+    field = build(None)
+    nx = len(field["xs"])
+    key = _key([], extra={"schema": FP.PREVIOUS_CACHE_SCHEMA, "excluded_geoms": sorted(raw_excluded)})
+    key.pop("excluded_scene_geoms")
+    sha = FP.key_sha256(key)
+    _write_complete_cache(str(tmp_path), field, key, sha, key["manifest_sha256"], nx)
+    return sha, key
+
+
+def test_old_cache_is_not_reused_without_verified_migration_and_migration_proves_before_copy(tmp_path):
+    source_sha, source_key = _write_v2_cache(tmp_path, {10} | NONCOLLIDABLE_TARGET)
+    dest_key = _key(FP.canonical_exclusion({10}, ELIGIBLE))
+    dest_sha = FP.key_sha256(dest_key)
+    # the canonical key does not find the old cache: no silent reuse
+    assert FP.verify_complete_cache(str(tmp_path), dest_key, dest_sha, REGION, config(), fake_geometry())[1] == ["completion marker missing"]
+    # migration refuses when the destination differs beyond the exclusion field (here: the manifest)
+    other = _key([10], manifest="x" * 64)
+    with pytest.raises(RuntimeError, match="differ beyond the exclusion"):
+        FP.migrate_cache_files(str(tmp_path), source_sha, other, FP.key_sha256(other), fake_geometry(), ELIGIBLE, REGION, config(), {})
+    # migration refuses when the canonical exclusions differ (a collidable geom excluded on one side only)
+    wider = _key(FP.canonical_exclusion({10, 11}, ELIGIBLE))
+    with pytest.raises(RuntimeError, match="canonical exclusion"):
+        FP.migrate_cache_files(str(tmp_path), source_sha, wider, FP.key_sha256(wider), fake_geometry(), ELIGIBLE, REGION, config(), {})
+    # migration refuses when the current geometry is out of tolerance
+    moved = fake_geometry()
+    moved["scene_xpos"][1, 0] += 0.005
+    with pytest.raises(RuntimeError, match="geometry"):
+        FP.migrate_cache_files(str(tmp_path), source_sha, dest_key, dest_sha, moved, ELIGIBLE, REGION, config(), {})
+    assert not os.path.exists(os.path.join(tmp_path, f"{dest_sha}.complete.json"))   # nothing written by failed proofs
+    # a valid migration copies byte-for-byte, keeps the source, and the canonical key then verifies
+    info = FP.migrate_cache_files(str(tmp_path), source_sha, dest_key, dest_sha, fake_geometry(), ELIGIBLE, REGION, config(),
+                                  {"migration_commit": "c" * 40})
+    assert info["completion_checks"] == "passed"
+    assert FP.file_sha256(os.path.join(tmp_path, f"{dest_sha}.npz")) == FP.file_sha256(os.path.join(tmp_path, f"{source_sha}.npz"))
+    assert FP.verify_complete_cache(str(tmp_path), dest_key, dest_sha, REGION, config(), fake_geometry())[1] == []
+    assert FP.verify_complete_cache(str(tmp_path), source_key, source_sha, REGION, config(), fake_geometry())[1] == []
+    marker = json.load(open(os.path.join(tmp_path, f"{dest_sha}.complete.json")))
+    assert marker["migrated_from"]["key_sha256"] == source_sha and marker["migration_commit"] == "c" * 40
+    # never overwrites an existing destination
+    with pytest.raises(RuntimeError, match="already exists"):
+        FP.migrate_cache_files(str(tmp_path), source_sha, dest_key, dest_sha, fake_geometry(), ELIGIBLE, REGION, config(), {})
+
+
+def test_migration_refuses_a_tampered_source(tmp_path):
+    source_sha, _ = _write_v2_cache(tmp_path, {10})
+    with open(os.path.join(tmp_path, f"{source_sha}.npz"), "ab") as f:
+        f.write(b"x")
+    dest_key = _key([10])
+    with pytest.raises(RuntimeError, match="completeness"):
+        FP.migrate_cache_files(str(tmp_path), source_sha, dest_key, FP.key_sha256(dest_key), fake_geometry(), ELIGIBLE, REGION, config(), {})

@@ -8,8 +8,9 @@ Margin-cache tooling for expert v3 (footprint_planner.py).
     # 3. regeneration / determinism test on a representative subset of x-slices, incl. an interrupted
     #    and resumed build, compared bit-for-bit with the stored cache
     python -u saga_robocasa/benchmark/margin_cache_tools.py regenerate --workers N --output DIR
-    # 4. re-key a complete schema-v1 cache as schema v2 without recomputing (proof: v1 key reproduced)
-    python -u saga_robocasa/benchmark/margin_cache_tools.py migrate --legacy-key SHA
+    # 4. re-key a complete older cache under the current schema without recomputing (proof before copy)
+    python -u saga_robocasa/benchmark/margin_cache_tools.py migrate --source-key SHA   # schema v2
+    python -u saga_robocasa/benchmark/margin_cache_tools.py migrate --legacy-key SHA   # schema v1
 
 All modes use the benchmark episode_047 reset (arm in the benchmark ready pose) and the benchmark region,
 resolutions, margins and thresholds; nothing about the grid or the margins is changed for speed.
@@ -140,11 +141,18 @@ def regenerate(args):
 
 
 def migrate(args):
-    """Re-key the complete schema-v1 cache under schema v2 (no recomputation; see FP.migrate_legacy_cache)."""
+    """
+    Re-key a complete cache under the current schema without recomputing it: --source-key for a schema-v2
+    cache (FP.migrate_cache, proof-before-copy), --legacy-key for a schema-v1 cache (FP.migrate_legacy_cache).
+    """
     bench, raw_env, start, region, thresholds, exclude, exact, qpos = setup()
     pconfig = FP.PlannerConfig()
-    info = FP.migrate_legacy_cache(raw_env, exact, start["ready_qpos"], region, pconfig, thresholds, exclude,
-                                   setup.manifest_sha256, args.legacy_key)
+    if args.source_key:
+        info = FP.migrate_cache(raw_env, exact, start["ready_qpos"], region, pconfig, thresholds, exclude,
+                                setup.manifest_sha256, args.source_key)
+    else:
+        info = FP.migrate_legacy_cache(raw_env, exact, start["ready_qpos"], region, pconfig, thresholds, exclude,
+                                       setup.manifest_sha256, args.legacy_key)
     info["host"] = host_info()
     print("MIGRATED", json.dumps(info), flush=True)
     bench.episode.close()
@@ -154,6 +162,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["benchmark", "build", "regenerate", "migrate"])
     parser.add_argument("--legacy-key", default=None, help="migrate: schema-v1 cache key to re-key")
+    parser.add_argument("--source-key", default=None, help="migrate: schema-v2 cache key to re-key under the canonical key")
     parser.add_argument("--workers", type=int, nargs="+", default=[1])
     parser.add_argument("--nodes", type=int, default=400)
     parser.add_argument("--output", default="/common/users/im484/saga_benchmark/planner_v3")

@@ -46,7 +46,12 @@ BENCHMARK_VERSION = "counter_to_sink_v1"
 # (footprint_planner.py) with explicit rotate/translate tracking and an exact runtime safety layer;
 # the v2 local filter is not used. expert_v2 remains selectable for comparisons.
 EXPERT_VERSION = "expert_v3"
-EXPERT_STATUS = "calibrated, not validated: base-dynamics coefficients from calibration job 679746; not yet validated in simulation"
+EXPERT_STATUS = ("calibrated, not validated: base-dynamics coefficients from calibration job 679746; controller-frame base "
+                 "actions (calibration job 1304551); 4-connected lattice, bounded recovery and a navigation budget; "
+                 "not yet validated in simulation")
+# Overall navigation budget for expert v3 (control steps over NAV_FOLLOW + NAV_ALIGN + NAV_SETTLE); derivation
+# in benchmark/plan_smoke_v3.py output and the commit that sets it.
+V3_NAVIGATION_BUDGET = None
 MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifests", "counter_to_sink_v1.json")
 
 
@@ -61,7 +66,10 @@ def benchmark_expert_configs(version=None):
 
         region = FP.benchmark_region(json.load(open(MANIFEST_PATH)))
         return ExpertConfig(stability_rule="convergence"), NavConfig(planner="footprint_lattice", lattice_region=region,
-                                                                     lattice_manifest_sha256=FP.file_sha256(MANIFEST_PATH))
+                                                                     lattice_manifest_sha256=FP.file_sha256(MANIFEST_PATH),
+                                                                     v3_base_action_frame="controller",
+                                                                     v3_translation_connectivity=4, v3_recovery=True,
+                                                                     v3_navigation_budget=V3_NAVIGATION_BUDGET or 0)
     raise ValueError(f"unknown expert version {version}")
 CAMERA_ID = "saga_external_v1"
 RANGES = {

@@ -21,6 +21,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import dataclasses  # noqa: E402
+import footprint_planner as FP  # noqa: E402
 import spot_utils as SU  # noqa: E402
 from benchmark.episodes import EXPERT_STATUS, EXPERT_VERSION, BenchmarkEpisode, git_commit, host_info, params_from_entry  # noqa: E402
 from expert_fsm import CARRY, ExpertAbort  # noqa: E402
@@ -97,6 +98,29 @@ class OverheadVideo:
         self.renderer.close()
 
 
+def tracking_report(trajectory, plan):
+    """Distance of the executed yaw-axis trajectory from the planned waypoint polyline (expert v3 only)."""
+    if not trajectory or not plan or not plan.get("waypoints"):
+        return None
+    points = [np.asarray(w["xy"], float) for w in plan["waypoints"]]
+    xy = np.array([t[:2] for t in trajectory])
+
+    def distance(p):
+        best = np.inf
+        for a, b in zip(points[:-1], points[1:]):
+            d = b - a
+            f = 0.0 if not d.any() else float(np.clip(np.dot(p - a, d) / np.dot(d, d), 0.0, 1.0))
+            best = min(best, float(np.linalg.norm(p - (a + f * d))))
+        return best
+
+    deviation = np.array([distance(p) for p in xy])
+    stride = max(1, len(trajectory) // 200)
+    return {"steps": len(trajectory), "max_deviation_from_plan_m": float(deviation.max()),
+            "mean_deviation_from_plan_m": float(deviation.mean()), "p95_deviation_from_plan_m": float(np.percentile(deviation, 95)),
+            "trajectory_axis_xy_yaw_downsampled": [list(map(float, t)) for t in trajectory[::stride]],
+            "planned_waypoints_axis": [w["xy"] + [w["yaw"]] for w in plan["waypoints"]]}
+
+
 def audit(bench, entry, video_dir=None, dense_clearance=False):
     params = params_from_entry(entry)
     start, nav_plan, report = bench.reset_to_spec(params)
@@ -112,6 +136,7 @@ def audit(bench, entry, video_dir=None, dense_clearance=False):
     initial_z = float(data.xpos[body][2])
     dense = {"steps": 0, "min": {"base": np.inf, "arm": np.inf, "gripper": np.inf}, "seconds": 0.0}
     timing = {"env_step_seconds": 0.0, "expert_seconds": 0.0, "nav_steps": 0}
+    trajectory = []
     fsm = None
     stats = {"min_clearance": {"navigation": {"base": np.inf, "arm": np.inf, "gripper": np.inf},
                                "manipulation": {"base": np.inf, "arm": np.inf, "gripper": np.inf}},
@@ -138,6 +163,9 @@ def audit(bench, entry, video_dir=None, dense_clearance=False):
             timing["env_step_seconds"] += t2 - t1
             if command.phase in NAV_PHASES:
                 timing["nav_steps"] += 1
+                if fsm.v3 is not None:  # executed yaw-axis trajectory (compared with the plan below)
+                    site_xy, yaw_now = SU.base_pose(raw_env)
+                    trajectory.append((*FP.axis_from_site(site_xy[:2], yaw_now, fsm.v3["offset"]).tolist(), float(yaw_now)))
                 if dense_clearance:
                     t3 = time.perf_counter()
                     rep = SU.clearance_report(raw_env.sim.model._model, data, SU.base_pose(raw_env)[0], exclude=fsm.object_geoms)
@@ -199,6 +227,7 @@ def audit(bench, entry, video_dir=None, dense_clearance=False):
         "final_object_in_sink_partial": bool(OU.obj_inside_of(raw_env, "obj", raw_env.sink, partial_check=True)),
         "timing": timing, "dense_navigation_clearance": dense if dense_clearance else None,
         "navigation_plan": None if fsm is None else {k: v for k, v in fsm.plans.get("navigation_v3", {}).items() if k != "cells"},
+        "navigation_tracking": tracking_report(trajectory, fsm.plans.get("navigation_v3") if fsm is not None else None),
         **stats, "events": events,
     }
     return result

@@ -117,6 +117,15 @@ def install(recorder=RECORDER):
         self.v3["last_where"] = where
         return ok, margin, where
 
+    if hasattr(NE.NavExpertFSM, "_v3_drive"):   # bounded-recovery drives (plan segment or correction leg)
+        original_drive = NE.NavExpertFSM._v3_drive
+
+        def _v3_drive(self, start, target, direction, index, phase, speed, mode, monitor):
+            recorder.on_segment("translate", start, target)
+            recorder.segment["drive_mode"] = mode
+            return (yield from original_drive(self, start, target, direction, index, phase, speed, mode, monitor))
+
+        NE.NavExpertFSM._v3_drive = _v3_drive
     NE.NavExpertFSM._v3_command, NE.NavExpertFSM.action = _v3_command, action
     NE.NavExpertFSM._v3_translate, NE.NavExpertFSM._v3_rotate = _v3_translate, _v3_rotate
     NE.NavExpertFSM._v3_admissible = _v3_admissible
@@ -135,59 +144,84 @@ def track_errors(segment, point):
     return float(length - np.dot(rel, u)), float(u[0] * rel[1] - u[1] * rel[0])  # remaining along, signed cross
 
 
-def trace_episode(bench, entry, max_steps, exact_every, base_action_frame="anchor"):
-    install()
-    bench.nav_config.v3_base_action_frame = base_action_frame
-    recorder = RECORDER
-    recorder.pending, recorder.segment = {}, None
+class StepTracer:
+    """
+    Per-step navigation trace around an existing control loop (read-only): call before() after the FSM
+    yielded the step's command and before fsm.action(command); after(command, step) once env.step returned.
+    """
+
+    def __init__(self, raw_env, fsm, exact_every=5, recorder=RECORDER):
+        install()
+        self.recorder, self.raw_env, self.fsm, self.exact_every = recorder, raw_env, fsm, exact_every
+        recorder.pending, recorder.segment = {}, None
+        self.model, self.data = raw_env.sim.model._model, raw_env.sim.data._data
+        plan = fsm.plans["navigation_v3"]
+        self.waypoints = [np.asarray(w["xy"]) for w in plan["waypoints"]]
+        self.joints = {s: self.model.joint(SU.EnvUtils.get_mobile_base_joint_name(raw_env, s)).id for s in ("forward", "side", "yaw")}
+        self.actuators = [a for a in range(self.model.nu) if self.model.actuator_trnid[a][0] in self.joints.values()]
+        self.offset = fsm.v3["offset"]
+        self.rows = []
+
+    def before(self):
+        self.site0, self.yaw0 = SU.base_pose(self.raw_env)
+        self.axis0 = FP.axis_from_site(self.site0[:2], self.yaw0, self.offset)
+        self.cached = self.fsm._v3_cached_margin()   # per-step cached measurement: no side effect
+
+    def after(self, command, step):
+        model, data, raw_env = self.model, self.data, self.raw_env
+        site1, yaw1 = SU.base_pose(raw_env)
+        axis1 = FP.axis_from_site(site1[:2], yaw1, self.offset)
+        record = self.recorder.take()
+        remaining, cross = track_errors(record.get("segment"), self.axis0)
+        if record.get("segment") and record["segment"]["p1"] is not None:
+            p1 = np.asarray(record["segment"]["p1"])
+            record["waypoint_index"] = int(np.argmin([np.linalg.norm(p1 - w) for w in self.waypoints]))
+        record.update(step=step, phase=command.phase, axis_xy_before=self.axis0.tolist(), site_xy_before=self.site0[:2].tolist(),
+                      yaw_before=float(self.yaw0), axis_xy_after=axis1.tolist(), yaw_after=float(yaw1),
+                      measured_axis_velocity=((axis1 - self.axis0) / 0.05).tolist(),
+                      measured_yaw_rate=float(np.angle(np.exp(1j * (yaw1 - self.yaw0)))) / 0.05,
+                      along_track_remaining=remaining, cross_track_error=cross, cached_margin_current=self.cached,
+                      base_ctrl=[float(data.ctrl[a]) for a in self.actuators],
+                      actual_controller_goal=[float(v) for v in np.asarray(SU.base_controller(raw_env).goal_qvel)],
+                      base_joint_qpos={s: float(data.qpos[model.jnt_qposadr[j]]) for s, j in self.joints.items()},
+                      base_joint_qvel={s: float(data.qvel[model.jnt_dofadr[j]]) for s, j in self.joints.items()},
+                      mode=command.info.get("v3_mode", record.get("mode")),
+                      recovery=command.info.get("v3_recovery"), navigation_steps_used=command.info.get("v3_navigation_steps"))
+        if self.exact_every and step % self.exact_every == 0:
+            clearance = SU.clearance_report(model, data, site1, exclude=self.fsm.object_geoms)
+            record["exact_clearance"] = {g: clearance[g]["distance"] for g in ("base", "arm", "gripper")}
+            record["exact_nearest"] = {g: clearance[g]["scene_geom"] for g in ("base", "arm", "gripper")}
+        self.rows.append(record)
+        return record
+
+    def summary(self):
+        plan = self.fsm.plans["navigation_v3"]
+        return {"cache": plan.get("cache", {}).get("key_sha256"), "cache_status": plan.get("cache", {}).get("cache"),
+                "plan_waypoints": [w["xy"] + [w["yaw"], w["segment_to_here"]] for w in plan["waypoints"]],
+                "base_actuators": [int(a) for a in self.actuators], "steps": len(self.rows), "rows": self.rows}
+
+
+def trace_episode(bench, entry, max_steps, exact_every, base_action_frame=None):
+    if base_action_frame is not None:
+        bench.nav_config.v3_base_action_frame = base_action_frame
     start, nav_plan, report = bench.reset_to_spec(params_from_entry(entry))
     raw_env, episode = bench.raw_env, bench.episode
-    model, data = raw_env.sim.model._model, raw_env.sim.data._data
     fsm = NE.NavExpertFSM(episode, bench.config, start, bench.nav_config, nav_plan)
-    plan = fsm.plans["navigation_v3"]
-    waypoints = [np.asarray(w["xy"]) for w in plan["waypoints"]]
-    joints = {s: model.joint(SU.EnvUtils.get_mobile_base_joint_name(raw_env, s)).id for s in ("forward", "side", "yaw")}
-    actuators = [a for a in range(model.nu) if model.actuator_trnid[a][0] in joints.values()]
-    offset = fsm.v3["offset"]
-    rows, failure = [], None
+    tracer = StepTracer(raw_env, fsm, exact_every)
+    failure = None
     try:
         for step, command in enumerate(fsm.commands()):
             if command.phase not in NE.NAV_PHASES or step >= max_steps:
                 break
-            site0, yaw0 = SU.base_pose(raw_env)
-            axis0 = FP.axis_from_site(site0[:2], yaw0, offset)
-            cached = fsm._v3_cached_margin()
+            tracer.before()
             action = fsm.action(command)
             episode.env.step(action)
-            site1, yaw1 = SU.base_pose(raw_env)
-            axis1 = FP.axis_from_site(site1[:2], yaw1, offset)
-            record = recorder.take()
-            remaining, cross = track_errors(record.get("segment"), axis0)
-            if record.get("segment") and record["segment"]["p1"] is not None:
-                p1 = np.asarray(record["segment"]["p1"])
-                record["waypoint_index"] = int(np.argmin([np.linalg.norm(p1 - w) for w in waypoints]))
-            record.update(step=step + 1, phase=command.phase, axis_xy_before=axis0.tolist(), site_xy_before=site0[:2].tolist(),
-                          yaw_before=float(yaw0), axis_xy_after=axis1.tolist(), yaw_after=float(yaw1),
-                          measured_axis_velocity=((axis1 - axis0) / 0.05).tolist(),
-                          measured_yaw_rate=float(np.angle(np.exp(1j * (yaw1 - yaw0)))) / 0.05,
-                          along_track_remaining=remaining, cross_track_error=cross, cached_margin_current=cached,
-                          base_ctrl=[float(data.ctrl[a]) for a in actuators],
-                          actual_controller_goal=[float(v) for v in np.asarray(SU.base_controller(raw_env).goal_qvel)],
-                          base_joint_qpos={s: float(data.qpos[model.jnt_qposadr[j]]) for s, j in joints.items()},
-                          base_joint_qvel={s: float(data.qvel[model.jnt_dofadr[j]]) for s, j in joints.items()},
-                          mode=command.info.get("v3_mode", record.get("mode")))
-            if exact_every and (step + 1) % exact_every == 0:
-                clearance = SU.clearance_report(model, data, site1, exclude=fsm.object_geoms)
-                record["exact_clearance"] = {g: clearance[g]["distance"] for g in ("base", "arm", "gripper")}
-                record["exact_nearest"] = {g: clearance[g]["scene_geom"] for g in ("base", "arm", "gripper")}
-            rows.append(record)
+            tracer.after(command, step + 1)
             fsm.observe(command)
     except ExpertAbort as error:
         failure = f"{error.phase}: {error.reason}"
     return {"episode_id": entry["episode_id"], "reset_hash_ok": report["initial_state_sha256"] == entry["initial_state_sha256"],
-            "cache": plan.get("cache", {}).get("key_sha256"), "cache_status": plan.get("cache", {}).get("cache"),
-            "plan_waypoints": [w["xy"] + [w["yaw"], w["segment_to_here"]] for w in plan["waypoints"]],
-            "base_actuators": [int(a) for a in actuators], "failure": failure, "steps": len(rows), "rows": rows}
+            "failure": failure, "base_action_frame": bench.nav_config.v3_base_action_frame, **tracer.summary()}
 
 
 def main():
@@ -196,8 +230,9 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--exact-every", type=int, default=5)
     parser.add_argument("--compare-audit", default=None, help="audit directory with the saved trajectory of the same run")
-    parser.add_argument("--base-action-frame", choices=["anchor", "controller"], default="anchor",
-                        help="NavConfig.v3_base_action_frame for the traced run (anchor = the configuration of job 1303312)")
+    parser.add_argument("--base-action-frame", choices=["anchor", "controller"], default=None,
+                        help="override NavConfig.v3_base_action_frame (default: the benchmark expert configuration; "
+                             "anchor = the configuration of job 1303312)")
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
     manifest = json.load(open(os.path.join(ROOT, "benchmark", "manifests", "counter_to_sink_v1.json")))
@@ -206,7 +241,6 @@ def main():
         index, max_steps = (int(x) for x in spec.split(":"))
         t = time.time()
         result = trace_episode(bench, manifest["episodes"][index], max_steps, args.exact_every, args.base_action_frame)
-        result["base_action_frame"] = args.base_action_frame
         result.update(seconds=time.time() - t, commit=git_commit(), **host_info())
         if args.compare_audit:
             saved = json.load(open(os.path.join(args.compare_audit, f"{result['episode_id']}.json")))["navigation_tracking"]

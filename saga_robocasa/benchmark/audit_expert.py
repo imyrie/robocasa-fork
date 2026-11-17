@@ -39,7 +39,13 @@ def failure_category(failure):
         return None
     phase, reason = failure["phase"], failure["reason"]
     if phase in NAV_PHASES or phase == "NAV_PLAN":
-        return "navigation_collision" if "unsafe" in reason else "navigation"
+        if "unsafe" in reason:
+            return "navigation_collision"
+        # expert v3 reasons are prefixed with their category (separately reported, never merged)
+        for category in ("navigation_timeout", "navigation_stall", "navigation_recovery_failed", "navigation_infeasible"):
+            if reason.startswith(category):
+                return category
+        return "navigation"
     if "missed grasp" in reason:
         return "missed_grasp"
     # A hold phase that times out while the grasp is intact is not a drop.
@@ -121,7 +127,7 @@ def tracking_report(trajectory, plan):
             "planned_waypoints_axis": [w["xy"] + [w["yaw"]] for w in plan["waypoints"]]}
 
 
-def audit(bench, entry, video_dir=None, dense_clearance=False):
+def audit(bench, entry, video_dir=None, dense_clearance=False, trace_dir=None, trace_exact_every=5):
     params = params_from_entry(entry)
     start, nav_plan, report = bench.reset_to_spec(params)
     raw_env, episode = bench.raw_env, bench.episode
@@ -143,11 +149,16 @@ def audit(bench, entry, video_dir=None, dense_clearance=False):
              "min_joint_margin": np.inf, "max_slip_position": 0.0, "max_slip_rotation": 0.0,
              "max_object_tilt_rad": 0.0, "max_object_tilt_carry_rad": 0.0, "max_object_rise_grasped": 0.0}
     steps, failure, success = 0, None, False
+    tracer = None
     started = time.time()
     try:
         t_plan = time.time()
         fsm = NavExpertFSM(episode, bench.config, start, bench.nav_config, nav_plan)
         timing["fsm_init_seconds"] = time.time() - t_plan
+        if trace_dir is not None and fsm.v3 is not None:
+            from benchmark.trace_navigation_v3 import StepTracer
+
+            tracer = StepTracer(raw_env, fsm, trace_exact_every)
         commands = fsm.commands()
         while True:
             t0 = time.perf_counter()
@@ -155,10 +166,15 @@ def audit(bench, entry, video_dir=None, dense_clearance=False):
                 command = next(commands)
             except StopIteration:
                 break
+            traced = tracer is not None and command.phase in NAV_PHASES
+            if traced:
+                tracer.before()
             action = fsm.action(command)
             t1 = time.perf_counter()
             episode.env.step(action)
             t2 = time.perf_counter()
+            if traced:
+                tracer.after(command, steps + 1)
             timing["expert_seconds"] += t1 - t0
             timing["env_step_seconds"] += t2 - t1
             if command.phase in NAV_PHASES:
@@ -204,6 +220,11 @@ def audit(bench, entry, video_dir=None, dense_clearance=False):
         failure = {"phase": error.phase, "reason": error.reason}
     if progress is not None and progress.frames:
         progress.write()
+    if tracer is not None:
+        os.makedirs(trace_dir, exist_ok=True)
+        with open(os.path.join(trace_dir, f"{entry['episode_id']}_trace.json"), "w") as file:
+            json.dump({"episode_id": entry["episode_id"], "reset_hash_ok": hash_match, "failure": failure,
+                       "base_action_frame": bench.nav_config.v3_base_action_frame, **tracer.summary()}, file, default=float)
     events = fsm.events if fsm is not None else []
     completed = {phase for phase, _ in events}
     inside = [info.get("partial") for phase, info in events if phase == "INSIDE_SINK_AFTER_SETTLE"]
@@ -240,6 +261,12 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--video-dir", default=None, help="also save an overhead diagnostic video per episode")
     parser.add_argument("--dense-clearance", action="store_true", help="exact clearance at every navigation step")
+    parser.add_argument("--require-success", action="store_true",
+                        help="gating mode: exit with status 1 if any requested episode fails or its initial-state hash "
+                             "does not match (default: batch reporter, always exit 0 after writing every result)")
+    parser.add_argument("--trace-dir", default=None,
+                        help="also write the per-step expert-v3 navigation trace (trace_navigation_v3) per episode")
+    parser.add_argument("--trace-exact-every", type=int, default=5)
     args = parser.parse_args()
     manifest = json.load(open(args.manifest))
     entries = manifest["episodes"] if args.episodes is None else [manifest["episodes"][i] for i in args.episodes]
@@ -255,8 +282,11 @@ def main():
     if not np.allclose(bench.goal_offset, manifest["reference"]["goal_offset_in_goal_frame"], atol=1e-9):
         raise SystemExit("reference goal offset differs from the manifest")
     default = lambda o: o.tolist() if isinstance(o, np.ndarray) else (o if isinstance(o, (str, int, bool)) else float(o))
+    failed = []
     for entry in entries:
-        result = audit(bench, entry, args.video_dir, args.dense_clearance)
+        result = audit(bench, entry, args.video_dir, args.dense_clearance, args.trace_dir, args.trace_exact_every)
+        if not (result["success"] and result["initial_state_hash_match"]):
+            failed.append(entry["episode_id"])
         with open(os.path.join(args.output, f"{entry['episode_id']}.json"), "w") as file:
             json.dump(result, file, indent=1, default=default)
         s = result["stages"]
@@ -265,7 +295,14 @@ def main():
               f"retract {int(s['retraction'])} success {int(s['final_check_success'])} | {result['steps']} steps "
               f"{result['wall_time_s']:.0f} s | {result['failure']}", flush=True)
     bench.episode.close()
+    print(f"AUDIT_SUMMARY requested {len(entries)} succeeded {len(entries) - len(failed)} failed {failed}", flush=True)
+    return exit_status(failed, args.require_success)
+
+
+def exit_status(failed, require_success):
+    """0 in the default batch mode (unchanged); with --require-success, 1 if any requested episode failed."""
+    return 1 if (require_success and failed) else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

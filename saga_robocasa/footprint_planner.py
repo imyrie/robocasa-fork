@@ -75,6 +75,11 @@ class PlannerConfig:
     verify_yaw_step: float = 0.02    # exact re-check spacing (rad)
     cache_tolerance: float = 0.01    # |cached - exact| node-margin disagreement that rejects a path
     snap_radius_cells: int = 2
+    # 8 (default, the original v3 planner): x, y and diagonal translation edges, straight start/goal
+    # connections. 4: x and y translation edges only (rotation edges separate), and the start/goal
+    # connections are axis-separated L-shapes (x then y or y then x, whichever is exactly admissible).
+    # Not part of the cache key: the cached x/y/yaw edge values are reused unchanged.
+    translation_connectivity: int = 8
 
 
 # --------------------------------------------------------------------------- exact margin
@@ -758,6 +763,14 @@ MOVES = [((1, 0, 0), "x", (0, 0, 0)), ((-1, 0, 0), "x", (-1, 0, 0)),
          ((0, 0, 1), "yaw", (0, 0, 0)), ((0, 0, -1), "yaw", (0, 0, -1))]
 
 
+def lattice_moves(config):
+    if config.translation_connectivity == 8:
+        return MOVES
+    if config.translation_connectivity == 4:
+        return [m for m in MOVES if m[1] in ("x", "y", "yaw")]
+    raise ValueError(f"translation_connectivity must be 4 or 8, not {config.translation_connectivity}")
+
+
 def plan_lattice(field, start_cell, goal_cell, config, blocked=None):
     node = field["node"]
     shape = node.shape
@@ -776,6 +789,7 @@ def plan_lattice(field, start_cell, goal_cell, config, blocked=None):
     start_cell, goal_cell = tuple(start_cell), tuple(goal_cell)
     if not ok[start_cell] or not ok[goal_cell]:
         return None, {"expanded": 0}
+    moves = lattice_moves(config)
     frontier = [(heuristic(start_cell), 0.0, start_cell)]
     cost, parent, closed = {start_cell: 0.0}, {start_cell: None}, set()
     expanded = 0
@@ -791,7 +805,7 @@ def plan_lattice(field, start_cell, goal_cell, config, blocked=None):
                 path.append(c)
                 c = parent[c]
             return path[::-1], {"expanded": expanded}
-        for (di, dj, dk), edge, (oi, oj, ok_) in MOVES:
+        for (di, dj, dk), edge, (oi, oj, ok_) in moves:
             n = (c[0] + di, c[1] + dj, c[2] + dk)
             if not all(0 <= n[q] < shape[q] for q in range(3)) or n in closed or not ok[n]:
                 continue
@@ -871,24 +885,41 @@ def plan_path(field, exact, qpos, start_xy, start_yaw, goal_xy, goal_yaw, config
         return worst
 
     # Connections are executed as pure motions: start -> rotate in place to the node yaw -> translate to
-    # the node; last node -> translate to the goal position -> rotate in place to the goal yaw.
-    def start_connection(c):
-        xy, h = cell_pose(field, c)
-        return [start_pose, (start_pose[0], h), (xy, h)]
+    # the node; last node -> translate to the goal position -> rotate in place to the goal yaw. With
+    # translation_connectivity 4 each translation is split into two axis-aligned legs (x then y, or y then
+    # x: the first order that is exactly admissible is used).
+    def legs(a, b, h, order):
+        if config.translation_connectivity == 8:
+            return [(b, h)]
+        corner = np.array([b[0], a[1]]) if order == "xy" else np.array([a[0], b[1]])
+        return [(corner, h), (b, h)]
 
-    def goal_connection(c):
+    def start_connection(c, order="xy"):
         xy, h = cell_pose(field, c)
-        return [(xy, h), (goal_pose[0], h), goal_pose]
+        return [start_pose, (start_pose[0], h)] + legs(start_pose[0], xy, h, order)
+
+    def goal_connection(c, order="xy"):
+        xy, h = cell_pose(field, c)
+        return [(xy, h)] + legs(xy, goal_pose[0], h, order) + [goal_pose]
+
+    orders = ("xy",) if config.translation_connectivity == 8 else ("xy", "yx")
 
     start_pose, goal_pose = (np.asarray(start_xy, float), float(start_yaw)), (np.asarray(goal_xy, float), float(goal_yaw))
     start_cell = goal_cell = None
+    start_order = goal_order = "xy"
     for c in candidates(*start_pose):
-        if connection_margin(start_connection(c)) >= config.buffer:
-            start_cell = c
+        for order in orders:
+            if connection_margin(start_connection(c, order)) >= config.buffer:
+                start_cell, start_order = c, order
+                break
+        if start_cell is not None:
             break
     for c in candidates(*goal_pose):
-        if connection_margin(goal_connection(c)) >= config.buffer:
-            goal_cell = c
+        for order in orders:
+            if connection_margin(goal_connection(c, order)) >= config.buffer:
+                goal_cell, goal_order = c, order
+                break
+        if goal_cell is not None:
             break
     if start_cell is None or goal_cell is None:
         stats.update(status="navigation_infeasible",
@@ -905,10 +936,11 @@ def plan_path(field, exact, qpos, start_xy, start_yaw, goal_xy, goal_yaw, config
         return stats
     keep = compress(cells)
     lattice = [cell_pose(field, cells[i]) for i in keep]
-    head, tail = start_connection(cells[0]), goal_connection(cells[-1])
+    head, tail = start_connection(cells[0], start_order), goal_connection(cells[-1], goal_order)
     waypoints = head + lattice[1:] + tail[1:]
-    kinds = ["rotate", "translate"] + ["rotate" if cells[keep[n + 1]][2] != cells[keep[n]][2] else "translate"
-                                       for n in range(len(keep) - 1)] + ["translate", "rotate"]
+    # every segment is either a pure rotation (same position) or a pure translation (same yaw)
+    kinds = ["rotate" if np.linalg.norm(np.asarray(b[0]) - np.asarray(a[0])) < 1e-12 and abs(b[1] - a[1]) > 0 else "translate"
+             for a, b in zip(waypoints[:-1], waypoints[1:])]
     # drop zero-length connection segments
     pruned_w, pruned_k = [waypoints[0]], []
     for (xy, h), kind in zip(waypoints[1:], kinds):
@@ -945,6 +977,7 @@ def plan_path(field, exact, qpos, start_xy, start_yaw, goal_xy, goal_yaw, config
                  exact_min_nearest=where, cache_discrepancies=discrepancies,
                  exact_evaluations=exact.count - evaluations0, exact_seconds=exact.seconds - seconds0,
                  start_cell=list(map(int, start_cell)), goal_cell=list(map(int, goal_cell)),
+                 translation_connectivity=config.translation_connectivity, connection_orders=[start_order, goal_order],
                  cells=[list(map(int, c)) for c in cells])
     if discrepancies:
         stats.update(status="navigation_infeasible",

@@ -49,9 +49,17 @@ EXPERT_VERSION = "expert_v3"
 EXPERT_STATUS = ("calibrated, not validated: base-dynamics coefficients from calibration job 679746; controller-frame base "
                  "actions (calibration job 1304551); 4-connected lattice, bounded recovery and a navigation budget; "
                  "not yet validated in simulation")
-# Overall navigation budget for expert v3 (control steps over NAV_FOLLOW + NAV_ALIGN + NAV_SETTLE); derivation
-# in benchmark/plan_smoke_v3.py output and the commit that sets it.
-V3_NAVIGATION_BUDGET = None
+# Overall navigation budget for expert v3: control steps over NAV_FOLLOW + NAV_ALIGN + NAV_SETTLE, beyond which
+# navigation fails as navigation_timeout. Derivation (planner-only check, job 1304645, commit 10603b6; summary in
+# config/plan_smoke_4conn.json): the longest 4-connected plan of the ten smoke episodes (episode_047, 2.89 m,
+# 35 translations + 4 rotations) needs 1407 steps if EVERY segment ran at the slowest scheduled speed
+# (0.06 m/s, 0.2 rad/s) plus 10 steps of start/stop overhead per segment (calibration job 1304551: 90 % speed
+# in 4 steps, stop settled in 2); 814 at the open speed. Allowance: bounded recovery ~300 steps (up to five
+# segments x 3 corrections at 0.06 m/s with stops) and final alignment + settle ~200 steps (earlier successful
+# runs used 15-161 NAV_ALIGN + 6 NAV_SETTLE steps). 1407 + 300 + 200 -> 2000, i.e. 2.5x the open-speed nominal of
+# the longest path and far below the 3218-step unbounded failure of job 1303312 (earlier successful navigations:
+# 159-283 steps with the old controller).
+V3_NAVIGATION_BUDGET = 2000
 MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifests", "counter_to_sink_v1.json")
 
 

@@ -60,7 +60,8 @@ def make_fsm(site_xy, yaw, goal_site_xy, goal_yaw, margin=0.25, record_poses=Non
     fsm.v3 = {"exact": Exact(), "field": field, "config": FP.PlannerConfig(), "offset": OFFSET,
               "plan": {"exact_evaluations": 0, "exact_seconds": 0.0}, "rejected": 0, "stalled": 0, "min_predicted": np.inf,
               "checks": 0, "check_seconds": 0.0, "last_xy": env.axis.copy(), "last_site": env.site.copy(),
-              "last_yaw": env.yaw, "velocity": np.zeros(3), "steps": 0, "measured_at": 0.0}
+              "last_yaw": env.yaw, "velocity": np.zeros(3), "steps": 0, "measured_at": 0.0,
+              "navigation_steps": 0, "replans": 0, "recoveries": [], "goal_axis": None}
 
     def nav_command(phase, index, base_velocity):
         c, s = np.cos(env.yaw), np.sin(env.yaw)
@@ -74,7 +75,8 @@ def make_fsm(site_xy, yaw, goal_site_xy, goal_yaw, margin=0.25, record_poses=Non
 
     fsm._nav_command = nav_command
     for name in ("_v3_cached_margin", "_v3_schedule", "_v3_measure", "_v3_position", "_v3_admissible", "_v3_command",
-                 "_v3_stop", "_v3_rotate", "_v3_translate", "_v3_final_alignment", "_base_command"):
+                 "_v3_stop", "_v3_rotate", "_v3_translate", "_v3_final_alignment", "_base_command",
+                 "_v3_drive", "_v3_correction_legs", "_v3_translate_with_recovery"):
         setattr(fsm, name, getattr(NE.NavExpertFSM, name).__get__(fsm))
     return fsm, env
 

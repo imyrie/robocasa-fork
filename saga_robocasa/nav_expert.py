@@ -38,6 +38,10 @@ NAV_PHASES = ("NAV_FOLLOW", "NAV_ALIGN", "NAV_SETTLE")
 PHASES = NAV_PHASES + MANIPULATION_PHASES
 
 
+class _ReplanRequest(Exception):
+    """Internal: bounded recovery found no admissible axis-aligned correction; re-plan from the measured pose."""
+
+
 @dataclass
 class NavConfig:
     start_distance_min: float = 1.4
@@ -128,6 +132,22 @@ class NavConfig:
     # robosuite's base set_goal rotation (theta = current yaw - controller reset yaw, read live; see
     # spot_utils.base_controller_frame), so the slide joints receive the intended commands at any heading.
     v3_base_action_frame: str = "anchor"
+    # Navigation robustness (defaults = the original v3 behaviour; the benchmark expert enables them):
+    #   v3_translation_connectivity: 8 = x/y/diagonal lattice edges; 4 = x/y only (footprint_planner).
+    #   v3_recovery: bounded recovery on plan translations: a cross-track error above v3_cross_track_limit
+    #     or a rejected command ends the drive with an exact stop; then a safety-checked axis-aligned
+    #     correction to the waypoint (x-then-y or y-then-x, whichever is exactly admissible) at
+    #     v3_correction_speed, at most v3_recovery_attempts per segment; if neither order is admissible,
+    #     one re-plan from the measured pose (v3_max_replans); otherwise navigation_recovery_failed.
+    #   v3_navigation_budget: hard cap on navigation control steps (NAV_FOLLOW + NAV_ALIGN + NAV_SETTLE)
+    #     -> navigation_timeout; 0 disables it.
+    v3_translation_connectivity: int = 8
+    v3_recovery: bool = False
+    v3_cross_track_limit: float = 0.02
+    v3_recovery_attempts: int = 3
+    v3_max_replans: int = 1
+    v3_correction_speed: float = 0.06
+    v3_navigation_budget: int = 0
 
 
 @dataclass
@@ -535,7 +555,7 @@ class NavExpertFSM(ExpertFSM):
         offset = FP.axis_offset()
         exact = FP.ExactMargin(self.raw_env, thresholds, self.object_geoms, offset)
         qpos = self.data.qpos.copy()
-        pconfig = FP.PlannerConfig()
+        pconfig = FP.PlannerConfig(translation_connectivity=nav.v3_translation_connectivity)
         t = time.perf_counter()
         field, cache = FP.load_or_build_field(self.raw_env, exact, qpos, self.start["ready_qpos"], nav.lattice_region,
                                               pconfig, thresholds, self.object_geoms, nav.lattice_manifest_sha256,
@@ -557,6 +577,7 @@ class NavExpertFSM(ExpertFSM):
         if plan["status"] != "ok":
             raise ExpertAbort("NAV_PLAN", f"navigation_infeasible: {plan.get('reason')}")
         self.v3 = {"exact": exact, "field": field, "config": pconfig, "plan": plan, "rejected": 0, "stalled": 0,
+                   "goal_axis": goal_axis, "navigation_steps": 0, "replans": 0, "recoveries": [],
                    "min_predicted": np.inf, "checks": 0, "check_seconds": 0.0, "offset": offset,
                    "last_xy": start_axis.copy(), "last_site": base_position[:2].copy(),
                    "last_yaw": base_yaw, "velocity": np.zeros(3), "steps": 0, "measured_at": float(self.data.time)}
@@ -641,6 +662,11 @@ class NavExpertFSM(ExpertFSM):
 
     def _v3_command(self, phase, index, world_command, horizon, mode):
         """Safety layer + emit: the command is sent only if admissible, else an exact stop."""
+        nav = self.nav_config
+        self.v3["navigation_steps"] += 1
+        if nav.v3_navigation_budget and self.v3["navigation_steps"] > nav.v3_navigation_budget:
+            raise ExpertAbort(phase, f"navigation_timeout: navigation exceeded its budget of {nav.v3_navigation_budget} "
+                                     f"control steps (mode {mode})")
         admissible, margin, where = self._v3_admissible(world_command, horizon)
         if admissible:
             self.v3["stalled"] = 0
@@ -656,7 +682,8 @@ class NavExpertFSM(ExpertFSM):
         c, s = np.cos(yaw), np.sin(yaw)
         base_frame = np.array([c * command[0] + s * command[1], -s * command[0] + c * command[1], command[2]])
         nav_command = self._nav_command(phase, index, base_frame)
-        nav_command.info.update(v3_mode=mode, v3_admissible=bool(admissible), v3_predicted_margin=float(margin))
+        nav_command.info.update(v3_mode=mode, v3_admissible=bool(admissible), v3_predicted_margin=float(margin),
+                                v3_navigation_steps=self.v3["navigation_steps"], v3_recovery=self.v3.get("recovery_state"))
         return nav_command
 
     def _v3_stop(self, phase, index_start, mode):
@@ -689,7 +716,7 @@ class NavExpertFSM(ExpertFSM):
             yield self._v3_command(phase, index, np.array([0.0, 0.0, np.sign(error) * rate_now]), horizon, "rotate")
             index += 1
             if index > nav.v3_segment_timeout * 4:
-                raise ExpertAbort(phase, "navigation_stall: rotation timeout")
+                raise ExpertAbort(phase, "navigation_timeout: rotation timeout")
         return index
 
     def _v3_position(self, frame):
@@ -705,6 +732,8 @@ class NavExpertFSM(ExpertFSM):
         nav = self.nav_config
         tolerance = nav.v3_waypoint_tolerance if tolerance is None else tolerance
         p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+        if nav.v3_recovery and not axis_only and frame == "axis":
+            return (yield from self._v3_translate_with_recovery(p0, p1, index, phase, speed, tolerance))
         for attempt in range(4):
             position, yaw, v = self._v3_position(frame)
             delta = p1 - position
@@ -733,23 +762,142 @@ class NavExpertFSM(ExpertFSM):
                 index += 1
                 steps += 1
                 if steps > nav.v3_segment_timeout:
-                    raise ExpertAbort(phase, "navigation_stall: translation timeout")
+                    raise ExpertAbort(phase, "navigation_timeout: translation timeout")
             index = yield from self._v3_stop(phase, index, "settle")
         return index
+
+    def _v3_drive(self, start, target, direction, index, phase, speed, mode, monitor):
+        """
+        Drive the yaw-axis point along `direction` (unit, world) from the line through `start` towards
+        `target`, through the safety layer, stopping early by the predicted coast; then an exact stop.
+        With `monitor`, the drive ends at once (exact stop) on a rejected command or a cross-track error
+        above v3_cross_track_limit. Returns (index, outcome) with outcome "arrived", "deviated" or "rejected".
+        """
+        nav = self.nav_config
+        steps = 0
+        outcome = "arrived"
+        while True:
+            position, _, v = self._v3_measure()
+            rel = position - start
+            cross = float(direction[0] * rel[1] - direction[1] * rel[0])
+            if monitor and abs(cross) > nav.v3_cross_track_limit:
+                outcome = "deviated"
+                break
+            remaining = float(np.dot(target - position, direction))
+            scheduled, _, horizon, _ = self._v3_schedule()
+            speed_now = scheduled if speed is None else min(speed, scheduled)
+            along = float(np.dot(v[:2], direction))
+            coast = max(0.0, along) * nav.v3_response_xy / max(1e-6, 1.0 - nav.v3_response_xy) / float(self.raw_env.control_freq)
+            if remaining <= coast:
+                break
+            command = self._v3_command(phase, index, np.array([*(speed_now * direction), 0.0]), horizon, mode)
+            yield command
+            index += 1
+            steps += 1
+            if monitor and not command.info["v3_admissible"]:
+                outcome = "rejected"
+                break
+            if steps > nav.v3_segment_timeout:
+                raise ExpertAbort(phase, "navigation_timeout: translation timeout")
+        index = yield from self._v3_stop(phase, index, "settle" if outcome == "arrived" else "recovery_stop")
+        return index, outcome
+
+    def _v3_correction_legs(self, position, target):
+        """
+        Axis-aligned correction from the measured yaw-axis position to `target` at the current yaw: the
+        first of x-then-y / y-then-x whose whole path is exactly admissible (margin >= buffer at
+        verify_step spacing, this episode's state). Legs shorter than 1 mm are dropped. None if neither is.
+        """
+        import footprint_planner as FP
+
+        _, yaw, _ = self._v3_measure()
+        config, qpos = self.v3["config"], self.data.qpos.copy()
+        for order in ("xy", "yx"):
+            corner = np.array([target[0], position[1]]) if order == "xy" else np.array([position[0], target[1]])
+            points = [position, corner, np.asarray(target, float)]
+            worst = np.inf
+            for a, b in zip(points[:-1], points[1:]):
+                for xy, h in FP.interpolate((a, yaw), (b, yaw), config):
+                    worst = min(worst, self.v3["exact"](qpos, xy, h, config.exact_cap)[0])
+                    if worst < config.buffer:
+                        break
+                if worst < config.buffer:
+                    break
+            if worst >= config.buffer:
+                legs = [(a, b) for a, b in zip(points[:-1], points[1:]) if np.linalg.norm(b - a) >= 1e-3]
+                return order, legs, worst
+        return None, None, None
+
+    def _v3_translate_with_recovery(self, p0, p1, index, phase, speed, tolerance):
+        """Plan translation with bounded recovery (see NavConfig.v3_recovery)."""
+        nav = self.nav_config
+        direction = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-12)
+        index, outcome = yield from self._v3_drive(p0, p1, direction, index, phase, speed, "translate", monitor=True)
+        attempts = 0
+        while True:
+            position, _, _ = self._v3_measure()
+            if np.linalg.norm(p1 - position) <= tolerance:
+                self.v3["recovery_state"] = None
+                return index
+            if attempts >= nav.v3_recovery_attempts:
+                raise ExpertAbort(phase, f"navigation_recovery_failed: {attempts} bounded corrections did not reach the "
+                                         f"waypoint (error {np.linalg.norm(p1 - position):.4f} m, last outcome {outcome})")
+            attempts += 1
+            order, legs, margin = self._v3_correction_legs(position, p1)
+            record = {"segment": [p0.tolist(), p1.tolist()], "attempt": attempts, "trigger": outcome,
+                      "position": position.tolist(), "error_m": float(np.linalg.norm(p1 - position)),
+                      "order": order, "margin": margin}
+            self.v3["recoveries"].append(record)
+            self.events.append(("NAV_RECOVERY", record))
+            if order is None:
+                if self.v3["replans"] < nav.v3_max_replans:
+                    raise _ReplanRequest(f"no admissible axis-aligned correction at {position.round(4).tolist()}")
+                raise ExpertAbort(phase, "navigation_recovery_failed: no admissible axis-aligned correction in either "
+                                         f"order and the re-plan budget ({nav.v3_max_replans}) is used")
+            self.v3["recovery_state"] = f"correction {attempts} order {order}"
+            for a, b in legs:
+                leg_direction = (b - a) / np.linalg.norm(b - a)
+                index, outcome = yield from self._v3_drive(a, b, leg_direction, index, phase, nav.v3_correction_speed,
+                                                           "correct", monitor=True)
+                if outcome != "arrived":
+                    break
+
+    def _v3_replan(self, reason):
+        """One re-plan from the measured pose to the original goal (same cache, buffer and exact verification)."""
+        import footprint_planner as FP
+
+        axis, yaw, _ = self._v3_measure()
+        self.v3["replans"] += 1
+        plan = FP.plan_path(self.v3["field"], self.v3["exact"], self.data.qpos.copy(), axis, yaw, self.v3["goal_axis"],
+                            self.start["base_yaw"], self.v3["config"])
+        self.events.append(("NAV_REPLAN", {"reason": reason, "from_axis": axis.tolist(), "from_yaw": yaw,
+                                           **{k: v for k, v in plan.items() if k not in ("waypoints", "cells")}}))
+        self.plans.setdefault("navigation_v3_replans", []).append(plan)
+        if plan["status"] != "ok":
+            raise ExpertAbort("NAV_FOLLOW", f"navigation_recovery_failed: re-plan from the measured pose failed "
+                                            f"({plan.get('reason')})")
+        return plan["waypoints"]
 
     def _navigation_v3(self):
         nav, plan = self.nav_config, self.v3["plan"]
         waypoints = plan["waypoints"]
         index = 0
-        for a, b in zip(waypoints[:-1], waypoints[1:]):
-            if b["segment_to_here"] == "rotate":
-                index = yield from self._v3_rotate(b["yaw"], index)
-            else:
-                index = yield from self._v3_translate(a["xy"], b["xy"], index)
-                _, yaw, _ = self._v3_measure()
-                if abs(np.angle(np.exp(1j * (b["yaw"] - yaw)))) > nav.v3_yaw_tolerance:
-                    index = yield from self._v3_rotate(b["yaw"], index)
-        self.events.append(("NAV_FOLLOW", {"steps": index, "planner": "footprint_lattice"}))
+        while True:
+            try:
+                for a, b in zip(waypoints[:-1], waypoints[1:]):
+                    if b["segment_to_here"] == "rotate":
+                        index = yield from self._v3_rotate(b["yaw"], index)
+                    else:
+                        index = yield from self._v3_translate(a["xy"], b["xy"], index)
+                        _, yaw, _ = self._v3_measure()
+                        if abs(np.angle(np.exp(1j * (b["yaw"] - yaw)))) > nav.v3_yaw_tolerance:
+                            index = yield from self._v3_rotate(b["yaw"], index)
+                break
+            except _ReplanRequest as request:
+                waypoints = self._v3_replan(str(request))
+        self.events.append(("NAV_FOLLOW", {"steps": index, "planner": "footprint_lattice", "replans": self.v3["replans"],
+                                           "recoveries": len(self.v3["recoveries"]),
+                                           "navigation_steps": self.v3["navigation_steps"]}))
 
     def _v3_final_alignment(self):
         """

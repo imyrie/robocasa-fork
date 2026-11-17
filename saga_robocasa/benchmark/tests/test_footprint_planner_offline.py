@@ -93,12 +93,22 @@ def test_corrupted_slice_is_recomputed(tmp_path):
     assert np.array_equal(np.nan_to_num(first["node"], nan=-9), np.nan_to_num(second["node"], nan=-9))
 
 
+def fake_geometry():
+    rng = np.random.default_rng(1)
+    return {"scene_ids": np.arange(5), "scene_xpos": rng.normal(size=(5, 3)), "scene_xmat": rng.normal(size=(5, 9)),
+            "robot_ids": np.arange(10, 13), "robot_rel": rng.normal(size=(3, 3)), "robot_xmat": rng.normal(size=(3, 9)),
+            "ready_qpos": rng.normal(size=6)}
+
+
 def _write_complete_cache(tmp_path, field, key, key_sha, manifest_sha, nx):
     path = os.path.join(tmp_path, f"{key_sha}.npz")
     arrays = {k: v for k, v in field.items() if isinstance(v, np.ndarray)}
     np.savez_compressed(path, **arrays)
+    geometry_path = os.path.join(tmp_path, f"{key_sha}.geometry.npz")
+    FP.save_geometry(geometry_path, fake_geometry())
     marker = {"key": key, "key_sha256": key_sha, "manifest_sha256": manifest_sha, "arrays_sha256": FP.field_checksum(arrays),
-              "npz_sha256": FP.file_sha256(path), "slices_expected": len(FP.expected_slices(nx)),
+              "npz_sha256": FP.file_sha256(path), "geometry_sha256": FP.file_sha256(geometry_path),
+              "slices_expected": len(FP.expected_slices(nx)),
               "slices_complete": len(FP.expected_slices(nx)), "build_seconds": 1.0}
     json.dump(marker, open(os.path.join(tmp_path, f"{key_sha}.complete.json"), "w"))
     return path, marker
@@ -111,8 +121,19 @@ def test_completion_verification(tmp_path):
     key_sha = "k" * 64
     cfg = config()
     path, marker = _write_complete_cache(str(tmp_path), field, key, key_sha, "m" * 64, nx)
-    ok, problems = FP.verify_complete_cache(str(tmp_path), key, key_sha, REGION, cfg)
+    ok, problems = FP.verify_complete_cache(str(tmp_path), key, key_sha, REGION, cfg, fake_geometry())
     assert ok is not None and problems == []
+    # geometry out of tolerance (a cabinet door opened by 5 mm) is rejected and named
+    moved = fake_geometry()
+    moved["scene_xpos"][2, 0] += 0.005
+    _, problems = FP.verify_complete_cache(str(tmp_path), key, key_sha, REGION, cfg, moved, names=lambda g: f"geom{g}")
+    assert problems and "scene_xpos" in problems[0] and "geom2" in problems[0]
+    # micrometre settling noise (as observed between resets) is accepted
+    noise = fake_geometry()
+    noise["scene_xpos"] += 3e-5
+    noise["scene_xmat"] += 2e-4
+    noise["ready_qpos"] += 9e-6
+    assert FP.verify_complete_cache(str(tmp_path), key, key_sha, REGION, cfg, noise)[1] == []
     # configuration hash
     assert "configuration hash mismatch" in FP.verify_complete_cache(str(tmp_path), {**key, "buffer": 0.05}, key_sha, REGION, cfg)[1]
     # manifest checksum
@@ -224,3 +245,15 @@ def test_benchmark_region_covers_yaw_axis_points():
             axis = FP.axis_from_site(xy, yaw, offset)
             assert region["x"][0] + 0.45 <= axis[0] <= region["x"][1] - 0.45
             assert region["y"][0] + 0.45 <= axis[1] <= region["y"][1] - 0.45
+
+
+def test_geometry_tolerance_comparison():
+    reference = fake_geometry()
+    assert FP.compare_geometry(reference, fake_geometry()) == []
+    changed_set = fake_geometry()
+    changed_set["scene_ids"] = np.arange(1, 6)
+    assert FP.compare_geometry(reference, changed_set) == ["scene_ids differ"]
+    arm = fake_geometry()
+    arm["ready_qpos"][0] += 2e-4                       # above the 1e-4 rad tolerance
+    assert any("ready_qpos" in p for p in FP.compare_geometry(reference, arm))
+    assert FP.CACHE_SCHEMA == "footprint_margin_field_v2" and FP.LEGACY_CACHE_SCHEMA == "footprint_margin_field_v1"

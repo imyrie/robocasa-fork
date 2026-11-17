@@ -8,6 +8,8 @@ Margin-cache tooling for expert v3 (footprint_planner.py).
     # 3. regeneration / determinism test on a representative subset of x-slices, incl. an interrupted
     #    and resumed build, compared bit-for-bit with the stored cache
     python -u saga_robocasa/benchmark/margin_cache_tools.py regenerate --workers N --output DIR
+    # 4. re-key a complete schema-v1 cache as schema v2 without recomputing (proof: v1 key reproduced)
+    python -u saga_robocasa/benchmark/margin_cache_tools.py migrate --legacy-key SHA
 
 All modes use the benchmark episode_047 reset (arm in the benchmark ready pose) and the benchmark region,
 resolutions, margins and thresholds; nothing about the grid or the margins is changed for speed.
@@ -137,16 +139,28 @@ def regenerate(args):
     bench.episode.close()
 
 
+def migrate(args):
+    """Re-key the complete schema-v1 cache under schema v2 (no recomputation; see FP.migrate_legacy_cache)."""
+    bench, raw_env, start, region, thresholds, exclude, exact, qpos = setup()
+    pconfig = FP.PlannerConfig()
+    info = FP.migrate_legacy_cache(raw_env, exact, start["ready_qpos"], region, pconfig, thresholds, exclude,
+                                   setup.manifest_sha256, args.legacy_key)
+    info["host"] = host_info()
+    print("MIGRATED", json.dumps(info), flush=True)
+    bench.episode.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["benchmark", "build", "regenerate"])
+    parser.add_argument("mode", choices=["benchmark", "build", "regenerate", "migrate"])
+    parser.add_argument("--legacy-key", default=None, help="migrate: schema-v1 cache key to re-key")
     parser.add_argument("--workers", type=int, nargs="+", default=[1])
     parser.add_argument("--nodes", type=int, default=400)
     parser.add_argument("--output", default="/common/users/im484/saga_benchmark/planner_v3")
     args = parser.parse_args()
     if args.mode != "benchmark":
         args.workers = args.workers[0]
-    {"benchmark": benchmark, "build": build, "regenerate": regenerate}[args.mode](args)
+    {"benchmark": benchmark, "build": build, "regenerate": regenerate, "migrate": migrate}[args.mode](args)
 
 
 if __name__ == "__main__":

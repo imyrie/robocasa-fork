@@ -47,7 +47,14 @@ import numpy as np
 
 import spot_utils as SU
 
-CACHE_SCHEMA = "footprint_margin_field_v1"
+CACHE_SCHEMA = "footprint_margin_field_v2"  # v2: continuous geometry checked against a stored reference with tolerances
+LEGACY_CACHE_SCHEMA = "footprint_margin_field_v1"  # v1 hashed continuous geometry rounded to 1e-6 (see cache_key_v1)
+# Continuous geometry tolerances for reusing a margin map. Observed reset-to-reset noise over the ten smoke
+# episodes: hinged cabinet doors settle by <= 3.0e-5 m / 2.2e-4 (rotation-matrix entries), ready arm pose
+# <= 9e-6 rad, robot geometry <= 3.3e-6 m. A displacement within these tolerances changes margins by well
+# under 1 mm (cache_tolerance 0.01 m, buffer 0.04 m), and every executed path is re-checked exactly.
+GEOMETRY_TOLERANCES = {"scene_position_m": 1e-4, "scene_rotation": 1e-3, "ready_arm_qpos_rad": 1e-4,
+                       "robot_position_m": 1e-4, "robot_rotation": 1e-3}
 CODE_VERSION = "footprint_planner_v2_yaw_axis_poses"
 POSE_PARAMETERIZATION = "yaw_axis_point"
 CACHE_DIR = "/common/users/im484/saga_benchmark/cache/footprint_margin"
@@ -129,7 +136,11 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256):
+def cache_geometry(raw_env, exact, ready_qpos):
+    """
+    Geometry the margin map depends on: static-scene geoms (live pose) and robot geoms relative to the base
+    centre site at the canonical pose with the ready arm. Returns (discrete identity, continuous arrays).
+    """
     model = raw_env.sim.model._model
     predictor = exact.predictor
     data = predictor.scratch
@@ -139,19 +150,86 @@ def cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, m
     qpos[qadr] = ready_qpos
     predictor.set_pose(qpos, [0.0, 0.0], 0.0)
     robot = sorted(g for part in predictor.robot.values() for g in part)
-    site = predictor.site
-    rel_pos = data.geom_xpos[robot] - data.site_xpos[site]
-    robot_hash = _sha(model.geom_type[robot], model.geom_size[robot], model.geom_dataid[robot], rel_pos,
-                      data.geom_xmat[robot])
     scene = sorted(predictor.scene)
     live = raw_env.sim.data._data
-    scene_hash = _sha(model.geom_type[scene], model.geom_size[scene], model.geom_dataid[scene],
-                      live.geom_xpos[scene], live.geom_xmat[scene])
+    discrete = {
+        "scene_geoms_sha256": hashlib.sha256(np.ascontiguousarray(np.array(scene, dtype=np.int64)).tobytes()
+                                             + np.ascontiguousarray(model.geom_type[scene].astype(np.int64)).tobytes()
+                                             + np.ascontiguousarray(model.geom_dataid[scene].astype(np.int64)).tobytes()).hexdigest(),
+        "scene_geom_sizes_sha256": _sha(model.geom_size[scene]),
+        "robot_geoms_sha256": hashlib.sha256(np.ascontiguousarray(np.array(robot, dtype=np.int64)).tobytes()
+                                             + np.ascontiguousarray(model.geom_type[robot].astype(np.int64)).tobytes()
+                                             + np.ascontiguousarray(model.geom_dataid[robot].astype(np.int64)).tobytes()).hexdigest(),
+        "robot_geom_sizes_sha256": _sha(model.geom_size[robot]),
+    }
+    continuous = {"scene_ids": np.array(scene, dtype=np.int64), "scene_xpos": live.geom_xpos[scene].copy(),
+                  "scene_xmat": live.geom_xmat[scene].copy(), "robot_ids": np.array(robot, dtype=np.int64),
+                  "robot_rel": data.geom_xpos[robot] - data.site_xpos[predictor.site], "robot_xmat": data.geom_xmat[robot].copy(),
+                  "ready_qpos": np.asarray(ready_qpos, dtype=float).copy()}
+    return discrete, continuous
+
+
+def cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256):
+    """
+    Returns (key, key_sha256, geometry). The key hashes only discrete/configuration identity (geom sets,
+    types, sizes, meshes, layout, code version, parameterization, region, grid, margins, thresholds,
+    exclusions, manifest); continuous geometry is returned separately and compared with
+    GEOMETRY_TOLERANCES against the reference stored with the cache (verify_complete_cache).
+    """
+    discrete, geometry = cache_geometry(raw_env, exact, ready_qpos)
+    key = {"layout_style": [int(raw_env.layout_id), int(raw_env.style_id)], **discrete,
+           "geometry_tolerances": GEOMETRY_TOLERANCES,
+           **static_key_fields(region, config, thresholds, exclude, manifest_sha256, exact.offset)}
+    return key, key_sha256(key), geometry
+
+
+def cache_key_v1(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256):
+    """The schema-v1 key (continuous geometry hashed after rounding to 1e-6); kept to verify migrations."""
+    discrete, g = cache_geometry(raw_env, exact, ready_qpos)
+    model = raw_env.sim.model._model
+    robot, scene = list(g["robot_ids"]), list(g["scene_ids"])
+    robot_hash = _sha(model.geom_type[robot], model.geom_size[robot], model.geom_dataid[robot], g["robot_rel"], g["robot_xmat"])
+    scene_hash = _sha(model.geom_type[scene], model.geom_size[scene], model.geom_dataid[scene], g["scene_xpos"], g["scene_xmat"])
     key = {"layout_style": [int(raw_env.layout_id), int(raw_env.style_id)],
            "static_scene_sha256": scene_hash, "robot_geometry_with_ready_arm_sha256": robot_hash,
            "ready_arm_qpos": np.round(ready_qpos, 4).tolist(),
            **static_key_fields(region, config, thresholds, exclude, manifest_sha256, exact.offset)}
+    key["schema"] = LEGACY_CACHE_SCHEMA
     return key, key_sha256(key)
+
+
+def compare_geometry(reference, current, names=None, tolerances=GEOMETRY_TOLERANCES):
+    """Problems (empty if within tolerance) between a stored reference geometry and the current one."""
+    problems = []
+    for ids in ("scene_ids", "robot_ids"):
+        if not np.array_equal(reference[ids], current[ids]):
+            return [f"{ids} differ"]
+    checks = (("scene_xpos", "scene_position_m", "scene_ids"), ("scene_xmat", "scene_rotation", "scene_ids"),
+              ("robot_rel", "robot_position_m", "robot_ids"), ("robot_xmat", "robot_rotation", "robot_ids"),
+              ("ready_qpos", "ready_arm_qpos_rad", None))
+    for array, tolerance, ids in checks:
+        diff = np.abs(np.asarray(reference[array], float) - np.asarray(current[array], float))
+        if diff.size and diff.max() > tolerances[tolerance]:
+            worst = []
+            if ids is not None:
+                per = diff.reshape(len(reference[ids]), -1).max(axis=1)
+                for i in np.argsort(per)[::-1][:5]:
+                    if per[i] > tolerances[tolerance]:
+                        geom = int(reference[ids][i])
+                        worst.append(f"{names(geom) if names else geom}: {per[i]:.2e}")
+            problems.append(f"{array} differs by {diff.max():.2e} > {tolerances[tolerance]} {worst}")
+    return problems
+
+
+def save_geometry(path, geometry):
+    tmp = path + ".tmp.npz"
+    np.savez(tmp, **geometry)
+    os.replace(tmp, path)
+
+
+def load_geometry(path):
+    with np.load(path) as archive:
+        return {k: archive[k] for k in archive.files}
 
 
 def static_key_fields(region, config, thresholds, exclude, manifest_sha256, offset):
@@ -379,20 +457,24 @@ def field_checksum(field):
                 *[np.nan_to_num(field[f"edge_{n}"], nan=-9) for n in ("x", "y", "d1", "d2", "yaw")])
 
 
-def verify_complete_cache(cache_dir, key, key_sha, region, config):
+def verify_complete_cache(cache_dir, key, key_sha, region, config, geometry=None, names=None):
     """
     Completeness checks before a cache is treated as complete. Returns (field or None, problems list).
     Checks: completion marker present; marker config hash == current key hash and stored key == current
-    key; manifest checksum; expected slice count; .npz file SHA-256; array shapes vs the lattice axes;
-    array checksum; no NaN node values.
+    key; manifest checksum; expected slice count; .npz file SHA-256; geometry reference file SHA-256 and,
+    if `geometry` is given, current continuous geometry within GEOMETRY_TOLERANCES of the reference;
+    array shapes vs the lattice axes; array checksum; no NaN node values.
     """
     path = os.path.join(cache_dir, f"{key_sha}.npz")
     marker_path = os.path.join(cache_dir, f"{key_sha}.complete.json")
+    geometry_path = os.path.join(cache_dir, f"{key_sha}.geometry.npz")
     problems = []
     if not os.path.exists(marker_path):
         return None, ["completion marker missing"]
     if not os.path.exists(path):
         return None, ["cache .npz missing"]
+    if not os.path.exists(geometry_path):
+        return None, ["geometry reference missing"]
     try:
         marker = json.load(open(marker_path))
     except (OSError, ValueError) as error:
@@ -407,8 +489,14 @@ def verify_complete_cache(cache_dir, key, key_sha, region, config):
         problems.append(f"slice count {marker.get('slices_complete')} != expected {len(expected_slices(nx))}")
     if file_sha256(path) != marker.get("npz_sha256"):
         problems.append("cache .npz file checksum mismatch (corrupted or replaced)")
+    if file_sha256(geometry_path) != marker.get("geometry_sha256"):
+        problems.append("geometry reference checksum mismatch")
     if problems:
         return None, problems
+    if geometry is not None:
+        problems += compare_geometry(load_geometry(geometry_path), geometry, names)
+        if problems:
+            return None, problems
     try:
         with np.load(path) as archive:
             field = {k: archive[k] for k in archive.files}
@@ -435,18 +523,25 @@ def load_or_build_field(raw_env, exact, qpos, ready_qpos, region, config, thresh
     slices are recomputed. The .npz is written to a temporary file and renamed; the completion
     marker is written last.
     """
-    key, key_sha = cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256)
+    key, key_sha, geometry = cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256)
+    names = lambda g: SU.geom_name(raw_env.sim.model._model, g)
     path = os.path.join(cache_dir, f"{key_sha}.npz")
     marker_path = os.path.join(cache_dir, f"{key_sha}.complete.json")
+    geometry_path = os.path.join(cache_dir, f"{key_sha}.geometry.npz")
     t = time.perf_counter()
-    field, problems = verify_complete_cache(cache_dir, key, key_sha, region, config)
+    field, problems = verify_complete_cache(cache_dir, key, key_sha, region, config, geometry, names)
     if field is not None:
         marker = json.load(open(marker_path))
         return field, {"cache": "reused", "key_sha256": key_sha, "path": path, "load_seconds": time.perf_counter() - t,
                        "build_seconds": marker["build_seconds"], "size_bytes": os.path.getsize(path),
-                       "arrays_sha256": marker["arrays_sha256"], "completion_checks": "passed"}
+                       "arrays_sha256": marker["arrays_sha256"], "completion_checks": "passed",
+                       "geometry_check": "within tolerances", "migrated_from": marker.get("migrated_from")}
     if not allow_build:
         raise RuntimeError(f"margin cache not usable ({'; '.join(problems)}): {path}")
+    if os.path.exists(marker_path) and any("differs" in p for p in problems):
+        # a complete cache exists for this configuration but the geometry is out of tolerance: never
+        # overwrite it silently
+        raise RuntimeError(f"geometry out of tolerance for the existing complete cache {path}: {'; '.join(problems)}")
     os.makedirs(cache_dir, exist_ok=True)
     partial_dir = os.path.join(cache_dir, f"{key_sha}.partial")
     os.makedirs(partial_dir, exist_ok=True)
@@ -471,7 +566,9 @@ def load_or_build_field(raw_env, exact, qpos, ready_qpos, region, config, thresh
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     dirty = bool(subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo, capture_output=True,
                                 text=True).stdout.strip())
+    save_geometry(geometry_path, geometry)
     marker = {"key": key, "key_sha256": key_sha, "manifest_sha256": manifest_sha256, "arrays_sha256": checksum,
+              "geometry_sha256": file_sha256(geometry_path),
               "code_commit": commit, "code_dirty": dirty,
               "npz_sha256": file_sha256(path), "slices_expected": len(expected_slices(nx)),
               "slices_complete": len(expected_slices(nx)) - len(missing), "shape": list(field["node"].shape),
@@ -479,10 +576,73 @@ def load_or_build_field(raw_env, exact, qpos, ready_qpos, region, config, thresh
               "slices_reused": field["slices_reused"], "slice_problems": field["slice_problems"], "workers": workers,
               "worker_memory": field["worker_memory"]}
     _atomic_json(marker_path, marker)  # written last: its presence marks the cache complete
-    return arrays, {"cache": f"built ({'; '.join(problems)})", "key_sha256": key_sha, "path": path,
+    # re-verify what was just written with the same checks a later reuse applies
+    _, after = verify_complete_cache(cache_dir, key, key_sha, region, config, geometry, names)
+    if after:
+        raise RuntimeError(f"cache written but failed completeness checks: {'; '.join(after)}")
+    return arrays, {"cache": "built", "build_reason": "; ".join(problems), "completion_checks": "passed",
+                    "key_sha256": key_sha, "path": path,
                     "build_seconds": field["build_seconds"], "evaluations": field["evaluations"],
                     "slices_reused": field["slices_reused"], "slice_problems": field["slice_problems"],
                     "size_bytes": os.path.getsize(path), "arrays_sha256": checksum, "partial_dir": partial_dir}
+
+
+def migrate_legacy_cache(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256, legacy_key_sha,
+                         cache_dir=CACHE_DIR):
+    """
+    Re-key a complete schema-v1 cache under schema v2 WITHOUT recomputing its arrays, after proving the
+    arrays belong to this geometry: the v1 key recomputed from the current simulator state must equal
+    `legacy_key_sha` (identical rounded geometry hashes and configuration), and the v1 cache must pass
+    its own completeness checks. Writes new files only (the v1 files are left untouched).
+    """
+    import shutil
+    import subprocess
+
+    v1_key, v1_sha = cache_key_v1(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256)
+    if v1_sha != legacy_key_sha:
+        raise RuntimeError(f"current geometry/configuration does not reproduce legacy key {legacy_key_sha} (got {v1_sha})")
+    old_npz = os.path.join(cache_dir, f"{v1_sha}.npz")
+    old_marker = json.load(open(os.path.join(cache_dir, f"{v1_sha}.complete.json")))
+    xs, ys, yaws = lattice_axes(region, config)
+    problems = []
+    if old_marker.get("key") != v1_key:
+        problems.append("legacy marker key mismatch")
+    if file_sha256(old_npz) != old_marker.get("npz_sha256"):
+        problems.append("legacy npz checksum mismatch")
+    if old_marker.get("slices_complete") != len(expected_slices(len(xs))):
+        problems.append("legacy slice count")
+    with np.load(old_npz) as archive:
+        field = {k: archive[k] for k in archive.files}
+    if field_checksum(field) != old_marker.get("arrays_sha256") or field["node"].shape != (len(xs), len(ys), len(yaws)) \
+            or np.isnan(field["node"]).any():
+        problems.append("legacy arrays checksum/shape/NaN")
+    if problems:
+        raise RuntimeError(f"legacy cache not complete: {problems}")
+    key, key_sha, geometry = cache_key(raw_env, exact, ready_qpos, region, config, thresholds, exclude, manifest_sha256)
+    path = os.path.join(cache_dir, f"{key_sha}.npz")
+    geometry_path = os.path.join(cache_dir, f"{key_sha}.geometry.npz")
+    marker_path = os.path.join(cache_dir, f"{key_sha}.complete.json")
+    if os.path.exists(marker_path):
+        raise RuntimeError(f"a schema-v2 cache already exists at {marker_path}; not overwriting")
+    shutil.copyfile(old_npz, path + ".tmp.npz")
+    os.replace(path + ".tmp.npz", path)
+    save_geometry(geometry_path, geometry)
+    repo = os.path.dirname(os.path.abspath(__file__))
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    dirty = bool(subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo, capture_output=True,
+                                text=True).stdout.strip())
+    marker = {**{k: old_marker[k] for k in ("arrays_sha256", "slices_expected", "slices_complete", "shape", "build_seconds",
+                                            "evaluations_this_run", "workers", "worker_memory")},
+              "key": key, "key_sha256": key_sha, "manifest_sha256": manifest_sha256, "npz_sha256": file_sha256(path),
+              "geometry_sha256": file_sha256(geometry_path), "code_commit": commit, "code_dirty": dirty,
+              "migrated_from": {"key_sha256": v1_sha, "schema": LEGACY_CACHE_SCHEMA, "built_with_commit": old_marker.get("code_commit"),
+                                "proof": "v1 key recomputed from the current state equals the legacy key; arrays copied byte-for-byte"}}
+    _atomic_json(marker_path, marker)
+    _, after = verify_complete_cache(cache_dir, key, key_sha, region, config, geometry, lambda g: SU.geom_name(raw_env.sim.model._model, g))
+    if after:
+        raise RuntimeError(f"migrated cache failed completeness checks: {after}")
+    return {"legacy_key_sha256": v1_sha, "key_sha256": key_sha, "path": path, "arrays_sha256": marker["arrays_sha256"],
+            "npz_sha256": marker["npz_sha256"], "geometry_sha256": marker["geometry_sha256"], "completion_checks": "passed"}
 
 
 # --------------------------------------------------------------------------- A* planner

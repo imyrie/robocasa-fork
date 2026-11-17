@@ -162,41 +162,52 @@ def main():
         print("smoke plan", json.dumps(smoke[-1]), flush=True)
     report["smoke_planner_only"] = smoke
 
-    # ---------------------------------------------------------------- 6. floor plan
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 2, figsize=(15, 7))
-    k_goal = int(np.argmin(np.abs(field["yaws"] - start["base_yaw"])))
-    for ax, (title, image) in zip(axes, (("margin at the goal yaw (m above abort threshold)", field["node"][:, :, k_goal]),
-                                         ("best margin over all yaws", np.nanmax(field["node"], axis=2)))):
-        im = ax.imshow(image.T, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], cmap="RdYlGn", vmin=-0.1, vmax=0.3)
-        ax.contour(xs, ys, image.T, levels=[pconfig.buffer], colors="k", linewidths=0.8)
-        ax.plot([FP.axis_from_site(p[0], p[1], offset)[0] for p in old], [FP.axis_from_site(p[0], p[1], offset)[1] for p in old], "m--", lw=2, label=f"old straight path (min exact margin {old_min:.3f} m)")
-        wx = [w["xy"][0] for w in plan["waypoints"]]
-        wy = [w["xy"][1] for w in plan["waypoints"]]
-        ax.plot(wx, wy, "b-", lw=2.5, label=f"v3 plan (exact min margin {plan['exact_min_margin']:.3f} m)")
-        for w in plan["waypoints"]:
-            ax.arrow(w["xy"][0], w["xy"][1], 0.12 * np.cos(w["yaw"]), 0.12 * np.sin(w["yaw"]), head_width=0.03, color="navy")
-        for c in cells[::4]:
-            xy, h = FP.cell_pose(field, c)
-            ax.annotate(f"{field['node'][tuple(c)]:.2f}", xy, fontsize=6, color="k")
-        ax.plot(*start_axis, "ko", ms=8)
-        ax.plot(*goal_axis, "k*", ms=12)
-        ax.set_title(title)
-        ax.set_xlabel("x (m)")
-        ax.set_ylabel("y (m)")
-        ax.legend(loc="upper left", fontsize=8)
-        fig.colorbar(im, ax=ax, shrink=0.8)
-    fig.suptitle("episode_047 (yaw-axis coordinates): start (dot), goal (star); black contour = 4 cm buffer; numbers = cached node margins")
-    fig.tight_layout()
-    figure = os.path.join(args.output, "episode_047_plan_floorplan.png")
-    fig.savefig(figure, dpi=110)
-    report["figure"] = figure
-    json.dump(report, open(os.path.join(args.output, "planner_v3_report.json"), "w"), indent=1, default=float)
+    # ---------------------------------------------------------------- 6. floor plan (optional diagnostic)
+    report_path = os.path.join(args.output, "planner_v3_report.json")
+    json.dump(report, open(report_path, "w"), indent=1, default=float)  # results first; the figure is optional
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as error:
+        plt = None
+        report["figure"] = f"skipped: {error}"
+        print("floor-plan figure skipped (matplotlib not installed); validation unaffected", flush=True)
+    if plt is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+        k_goal = int(np.argmin(np.abs(field["yaws"] - start["base_yaw"])))
+        for ax, (title, image) in zip(axes, (("margin at the goal yaw (m above abort threshold)", field["node"][:, :, k_goal]),
+                                             ("best margin over all yaws", np.nanmax(field["node"], axis=2)))):
+            im = ax.imshow(image.T, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], cmap="RdYlGn", vmin=-0.1, vmax=0.3)
+            ax.contour(xs, ys, image.T, levels=[pconfig.buffer], colors="k", linewidths=0.8)
+            ax.plot([FP.axis_from_site(p[0], p[1], offset)[0] for p in old], [FP.axis_from_site(p[0], p[1], offset)[1] for p in old], "m--", lw=2, label=f"old straight path (min exact margin {old_min:.3f} m)")
+            wx = [w["xy"][0] for w in plan["waypoints"]]
+            wy = [w["xy"][1] for w in plan["waypoints"]]
+            ax.plot(wx, wy, "b-", lw=2.5, label=f"v3 plan (exact min margin {plan['exact_min_margin']:.3f} m)")
+            for w in plan["waypoints"]:
+                ax.arrow(w["xy"][0], w["xy"][1], 0.12 * np.cos(w["yaw"]), 0.12 * np.sin(w["yaw"]), head_width=0.03, color="navy")
+            for c in cells[::4]:
+                xy, h = FP.cell_pose(field, c)
+                ax.annotate(f"{field['node'][tuple(c)]:.2f}", xy, fontsize=6, color="k")
+            ax.plot(*start_axis, "ko", ms=8)
+            ax.plot(*goal_axis, "k*", ms=12)
+            ax.set_title(title)
+            ax.set_xlabel("x (m)")
+            ax.set_ylabel("y (m)")
+            ax.legend(loc="upper left", fontsize=8)
+            fig.colorbar(im, ax=ax, shrink=0.8)
+        fig.suptitle("episode_047 (yaw-axis coordinates): start (dot), goal (star); black contour = 4 cm buffer; numbers = cached node margins")
+        fig.tight_layout()
+        figure = os.path.join(args.output, "episode_047_plan_floorplan.png")
+        fig.savefig(figure, dpi=110)
+        report["figure"] = figure
+    json.dump(report, open(report_path, "w"), indent=1, default=float)
+    smoke_ok = all(r.get("cache") == "reused" and r.get("status") == "ok" and r.get("discrepancies") == 0 for r in smoke)
+    report["smoke_all_reuse_one_cache_and_plan_ok"] = bool(smoke_ok)
+    json.dump(report, open(report_path, "w"), indent=1, default=float)
+    print("smoke planner-only: all ten reuse one cache and plan ok:", smoke_ok, flush=True)
     all_ok = all(checks.values()) and report["blocked_case"]["status"] == "navigation_infeasible" and \
-        report["reuse"]["reuse_path_identical"]
+        report["reuse"]["reuse_path_identical"] and smoke_ok
     print("PLANNER TESTS", "PASS" if all_ok else "FAIL", flush=True)
     bench.episode.close()
 

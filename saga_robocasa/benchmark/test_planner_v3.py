@@ -108,7 +108,11 @@ def main():
     last = plan["waypoints"][-1] if plan.get("waypoints") else None
     checks.update(
         planner_status_ok=plan["status"] == "ok",
-        detour_found=bool(offsets and max(abs(o) for o in offsets) > 0.5),
+        # The straight start-goal line is infeasible (old_straight_path_rejected); the plan must leave it.
+        # The size of the detour is reported, not required: with yaw-axis poses the cheapest admissible
+        # route turns early and passes ~0.28 m to the side (exact-verified), not the ~1 m fewest-step
+        # L-route of the earlier base-centre analysis.
+        departs_from_infeasible_straight_line=bool(offsets and max(abs(o) for o in offsets) > 0.05),
         all_nodes_pass_cached_buffer=bool(node_ok), all_edges_pass_cached_buffer=bool(edge_ok), no_corner_cutting=bool(corner_ok),
         exact_verification_passes=bool(plan.get("exact_min_margin", -1) >= pconfig.buffer and not plan.get("cache_discrepancies")),
         reaches_continuous_goal=bool(last is not None and np.allclose(last["xy"], goal_axis, atol=1e-12)

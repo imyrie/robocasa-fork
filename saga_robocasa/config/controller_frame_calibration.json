@@ -1,0 +1,208 @@
+{
+ "source": "/common/users/im484/saga_benchmark/calibration/controller_frame_v2 (Slurm job 1304551)",
+ "commit": [
+  "a57fca3f1d4ddf19e017b0f0ee6617479290ef14",
+  true
+ ],
+ "host": "rlab4.cs.rutgers.edu",
+ "script": "saga_robocasa/benchmark/calibrate_controller_frame.py",
+ "controller_precondition": {
+  "controller": "MobileBaseJointVelocityController",
+  "impedance_mode": "fixed",
+  "interpolator": null,
+  "actuator_min": [
+   -1.0,
+   -1.0,
+   -1.5
+  ],
+  "actuator_max": [
+   1.0,
+   1.0,
+   1.5
+  ],
+  "joint_names": [
+   "leg0_joint_mobile_forward",
+   "leg0_joint_mobile_side",
+   "leg0_joint_mobile_yaw"
+  ],
+  "ok": true
+ },
+ "reset_frame": {
+  "controller": "MobileBaseJointVelocityController",
+  "convention": "standard",
+  "reset_yaw": -0.001929091871716082,
+  "current_yaw": -0.001929091871716082,
+  "theta": 0.0
+ },
+ "open_pose": {
+  "xy": [
+   1.9610894196758177,
+   -2.660258859156524
+  ],
+  "reference_yaw": -0.001929091880918566,
+  "worst_margin": 0.09970149463899601
+ },
+ "offsets_rad": [
+  0.0,
+  0.25,
+  -0.25,
+  0.5,
+  -0.5,
+  0.75,
+  -0.75
+ ],
+ "gates": {
+  "direction_error_deg": 2.0,
+  "speed_error_fraction": 0.1,
+  "inactive_qvel": 0.002,
+  "perpendicular_speed": 0.002,
+  "goal_agreement": 1e-05,
+  "stop_speed": 0.005,
+  "stop_steps": 15
+ },
+ "controller_mode": {
+  "gate_segments": 49,
+  "passed": 49,
+  "all_pass": true,
+  "direction_error_deg_range": [
+   0.00016468096362138836,
+   0.001112592859450358
+  ],
+  "speed_error_fraction_range": [
+   -8.54253069201838e-05,
+   -4.557219212233954e-05
+  ],
+  "active_goal_min_abs_range": [
+   0.32070936565237185,
+   0.3499999940395355
+  ],
+  "inactive_joint_max_abs_qvel_range": [
+   1.6966918998887608e-07,
+   5.861882400761118e-07
+  ],
+  "perpendicular_mean_abs_speed_range": [
+   1.7645948426903146e-06,
+   1.941710539909991e-06
+  ],
+  "goal_agreement_max_range": [
+   0.0,
+   0.0
+  ],
+  "steps_to_90pct_range": [
+   4,
+   4
+  ],
+  "stop_settle_steps_range": [
+   2,
+   2
+  ],
+  "stop_distance_m_range": [
+   0.001081665932423248,
+   0.0012294039076120866
+  ],
+  "change_old_axis_settle_steps_range": [
+   2,
+   2
+  ]
+ },
+ "anchor_mode_comparison_by_offset": {
+  "0.0": {
+   "max_direction_error_deg": 0.012772883964036412,
+   "speed_error_fraction_range": [
+    -8.469334010566265e-05,
+    -5.8688992033845144e-05
+   ],
+   "aborted_segments": []
+  },
+  "0.25": {
+   "max_direction_error_deg": 43.28748202726756,
+   "speed_error_fraction_range": [
+    -0.10877777569595876,
+    0.4011401259828201
+   ],
+   "aborted_segments": [
+    "diag +x-y"
+   ]
+  },
+  "-0.25": {
+   "max_direction_error_deg": 43.289585310416875,
+   "speed_error_fraction_range": [
+    -0.10876923078697392,
+    0.40150760037483135
+   ],
+   "aborted_segments": []
+  },
+  "0.5": {
+   "max_direction_error_deg": 44.28420309128996,
+   "speed_error_fraction_range": [
+    -0.42773539992902243,
+    0.8518527267270437
+   ],
+   "aborted_segments": [
+    "diag +x-y"
+   ]
+  },
+  "-0.5": {
+   "max_direction_error_deg": 44.28636220792426,
+   "speed_error_fraction_range": [
+    -0.4277285787460517,
+    0.8518800643117835
+   ],
+   "aborted_segments": [
+    "diag +x+y"
+   ]
+  },
+  "0.75": {
+   "max_direction_error_deg": 44.91678457847136,
+   "speed_error_fraction_range": [
+    -0.9253702449453217,
+    1.0324360360116076
+   ],
+   "aborted_segments": [
+    "diag +x-y"
+   ]
+  },
+  "-0.75": {
+   "max_direction_error_deg": 37.42307524958132,
+   "speed_error_fraction_range": [
+    -0.9253698566036672,
+    -0.923303283422437
+   ],
+   "aborted_segments": [
+    "diag +x+y",
+    "diag +x-y"
+   ]
+  }
+ },
+ "yaw_diagnostics": {
+  "controller_yaw_joint": {
+   "site_speed_mean_range": [
+    0.08780236683235262,
+    0.0878035237308307
+   ],
+   "yaw_rate_abs_min": 0.30069702344309623
+  },
+  "controller_yaw_compensated": {
+   "site_speed_mean_range": [
+    0.007405500176511802,
+    0.01115065852185516
+   ],
+   "yaw_rate_abs_min": 0.30069205443752167
+  },
+  "anchor_yaw_joint": {
+   "site_speed_mean_range": [
+    0.08780236683234485,
+    0.08780352373328246
+   ],
+   "yaw_rate_abs_min": 0.30069702344307675
+  },
+  "anchor_yaw_compensated": {
+   "site_speed_mean_range": [
+    0.0301538979761418,
+    0.14549307185987176
+   ],
+   "yaw_rate_abs_min": 0.30051804285992945
+  }
+ },
+ "conclusion": "Controller-frame mode meets every gate at controller-relative yaw offsets 0, +-0.25, +-0.5, +-0.75 rad (single axes both signs, diagonals, direction change, stops). The old anchor mode is exact only at offset 0 (diagonals 43-45 deg off, axis speed -11/-43/-92 % at 0.25/0.5/0.75 rad). Compensated in-place yaw, broken in anchor mode (site drift 0.03-0.15 m/s), holds the site within 0.007-0.011 m/s in controller-frame mode: the 2026-10-22 compensated-yaw finding had the same root cause. Expert v3 keeps joint-only yaw (unchanged)."
+}

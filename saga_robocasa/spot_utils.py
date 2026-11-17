@@ -743,6 +743,25 @@ def controller_pre_rotation(joint, frame):
     return action
 
 
+_SCRATCH_DATA = {}
+
+
+def _fresh_site_xmat(raw_env, site_name):
+    """Site orientation from forward kinematics of the CURRENT qpos/mocap state, on a scratch MjData."""
+    model, data = raw_env.sim.model._model, raw_env.sim.data._data
+    entry = _SCRATCH_DATA.get(id(model))
+    if entry is None or entry[0] is not model:
+        entry = (model, mujoco.MjData(model))
+        _SCRATCH_DATA.clear()
+        _SCRATCH_DATA[id(model)] = entry
+    scratch = entry[1]
+    scratch.qpos[:] = data.qpos
+    scratch.mocap_pos[:] = data.mocap_pos
+    scratch.mocap_quat[:] = data.mocap_quat
+    mujoco.mj_kinematics(model, scratch)
+    return scratch.site_xmat[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)].reshape(3, 3).copy()
+
+
 def base_controller(raw_env):
     return raw_env.robots[0].composite_controller.part_controllers["base"]
 
@@ -766,7 +785,10 @@ def base_controller_frame(raw_env):
         convention = "standard"
     else:
         raise TypeError(f"unsupported base controller {type(controller).__name__}")
-    _, current = controller.get_base_pose()
+    # robosuite reads the site orientation inside set_goal AFTER the env's sim.forward(); after mj_step the
+    # live site_xmat is still from before the last substep's integration (stale by one 2 ms substep while
+    # the base rotates). Recompute it from the current qpos on a scratch MjData (no side effects on the sim).
+    current = _fresh_site_xmat(raw_env, f"{controller.naming_prefix}center")
     reset_yaw = T.mat2euler(controller.init_ori)[2]
     current_yaw = T.mat2euler(current)[2]
     return {"controller": type(controller).__name__, "convention": convention, "reset_yaw": float(reset_yaw),

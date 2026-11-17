@@ -81,19 +81,40 @@ def main():
                                                       "gripper": config.min_gripper_clearance})
     qpos = data.qpos.copy()
     reference_yaw = float(start["base_yaw"])
-    # most open pose that stays open at every tested heading
+    # most open pose over everything a segment can reach at every tested heading: the start, the end of each
+    # translation (0.10 m/s x 2 s = 0.20 m; checked at +-0.25 m in x and y, which covers the diagonals and the
+    # stop distance) and the yaw sweeps (+-0.3 rad/s x 2 s = +-0.6 rad, about the site (compensated) and about
+    # the yaw axis (joint only)), all against the exact clearance margin
+    import footprint_planner as FP
+
+    offset_axis = FP.axis_offset()
+
+    def reachable(x, y, heading):
+        poses = [(x, y, heading)] + [(x + dx, y + dy, heading) for dx, dy in ((0.25, 0), (-0.25, 0), (0, 0.25), (0, -0.25))]
+        axis = FP.axis_from_site(np.array([x, y]), heading, offset_axis)
+        for dh in (0.6, -0.6):
+            poses.append((x, y, heading + dh))
+            site = FP.site_from_axis(axis, heading + dh, offset_axis)
+            poses.append((site[0], site[1], heading + dh))
+        return poses
+
     s_xy, g_xy = np.asarray(nav_plan["xy"]), np.asarray(start["base_xy"])
     best = (-np.inf, None)
     for x in np.arange(min(s_xy[0], g_xy[0]) - 0.4, max(s_xy[0], g_xy[0]) + 0.4, 0.1):
         for y in np.arange(min(s_xy[1], g_xy[1]) - 0.4, max(s_xy[1], g_xy[1]) + 0.4, 0.1):
             worst = np.inf
             for off in args.offsets:
-                predictor.set_pose(qpos, [x, y], reference_yaw + off)
-                worst = min(worst, predictor.margin(cap=0.6)[0])
+                for px, py, ph in reachable(x, y, reference_yaw + off):
+                    predictor.set_pose(qpos, [px, py], ph)
+                    worst = min(worst, predictor.margin(cap=0.6)[0])
+                    if worst <= best[0]:
+                        break
+                if worst <= best[0]:
+                    break
             if worst > best[0]:
                 best = (worst, np.array([x, y]))
     open_margin, open_xy = best
-    print(f"open pose {open_xy.round(3).tolist()} worst margin over offsets {open_margin:.3f}", flush=True)
+    print(f"open pose {open_xy.round(3).tolist()} worst margin over offsets and reachable poses {open_margin:.3f}", flush=True)
     controller = SU.base_controller(raw_env)
     precondition = SU.check_base_controller(raw_env)
 

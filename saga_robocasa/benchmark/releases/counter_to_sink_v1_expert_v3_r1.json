@@ -1,0 +1,552 @@
+{
+ "release_id": "counter_to_sink_v1_expert_v3_r1",
+ "benchmark_version": "counter_to_sink_v1",
+ "frozen_on": "2026-11-21",
+ "statement": "Frozen benchmark and dataset release: SAGA-style mobile pick-and-place (not an exact SAGA reproduction). Expert behaviour is frozen at expert_behavior_commit; no change to the expert, manifest, cache, cameras, observations, controller, thresholds or success definition is allowed under this release id.",
+ "provenance": {
+  "expert_behavior_commit": "cf141337124c93f3f820122088aa3a265b1f6d60",
+  "audit_tooling_commit": "ce3808c09f2fdb675ced1c06782d6aa01bbf87e3",
+  "record_written_at_commit": "ce3808c09f2fdb675ced1c06782d6aa01bbf87e3",
+  "record_written_dirty": false,
+  "expert_behavior_files": [
+   "robocasa",
+   "saga_robocasa/nav_expert.py",
+   "saga_robocasa/expert_fsm.py",
+   "saga_robocasa/footprint_planner.py",
+   "saga_robocasa/spot_utils.py",
+   "saga_robocasa/controlled_episode.py",
+   "saga_robocasa/policy_cameras.py",
+   "saga_robocasa/pick_place_sink_test.py",
+   "saga_robocasa/record_expert_demo.py",
+   "saga_robocasa/benchmark/episodes.py",
+   "saga_robocasa/benchmark/manifests",
+   "saga_robocasa/config/base_action_map.json",
+   "saga_robocasa/config/base_response.json",
+   "saga_robocasa/config/controller_frame_calibration.json"
+  ],
+  "expert_behavior_files_identical_at_head": true,
+  "robosuite_commit": "5ce6643f3092639d08f7b0f90ed1c6a84f50552c"
+ },
+ "manifest": {
+  "path": "saga_robocasa/benchmark/manifests/counter_to_sink_v1.json",
+  "sha256": "a6f728dd8c93933b4a63a61034d3a7c0ff8f5e0f2ae6841be156b6cf136320bf",
+  "checksum_file": "saga_robocasa/benchmark/manifests/counter_to_sink_v1.sha256",
+  "generation_record": "saga_robocasa/benchmark/manifests/counter_to_sink_v1_generation.json",
+  "generation_record_sha256": "0560cde5cbf412541d1806c65a689cd46a5e4c79c492b73bcb361a4e404acf43",
+  "generated_at_commit": "db1e63f5163e36f4956073ddbd015d681c717bbd",
+  "master_seed": 20261018,
+  "episodes": 100,
+  "ranges": {
+   "start_distance_m": [
+    1.4,
+    2.4
+   ],
+   "start_bearing_halfwidth_rad": 1.2,
+   "start_yaw_offset_halfwidth_rad": 1.5707963267948966,
+   "object_xy_halfwidth_m": 0.03,
+   "object_yaw_halfwidth_rad": 3.141592653589793
+  },
+  "initial_condition_checks": {
+   "support_margin_m": 0.02,
+   "max_settle_shift_m": 0.003,
+   "max_object_tilt_rad": 0.05235987755982989,
+   "max_ik_position_error_m": 0.005,
+   "max_ik_approach_error_rad": 0.03,
+   "min_ik_joint_margin_rad": 0.1,
+   "goal_min_base_clearance_m": 0.05,
+   "goal_min_robot_clearance_m": 0.02
+  }
+ },
+ "split": {
+  "rule": "episode_000-049 train, episode_050-099 heldout (fixed before collection); heldout episodes are never used for gradient updates, recoveries, normalization statistics, hyperparameters, early stopping or checkpoint selection",
+  "train": [
+   "episode_000",
+   "episode_001",
+   "episode_002",
+   "episode_003",
+   "episode_004",
+   "episode_005",
+   "episode_006",
+   "episode_007",
+   "episode_008",
+   "episode_009",
+   "episode_010",
+   "episode_011",
+   "episode_012",
+   "episode_013",
+   "episode_014",
+   "episode_015",
+   "episode_016",
+   "episode_017",
+   "episode_018",
+   "episode_019",
+   "episode_020",
+   "episode_021",
+   "episode_022",
+   "episode_023",
+   "episode_024",
+   "episode_025",
+   "episode_026",
+   "episode_027",
+   "episode_028",
+   "episode_029",
+   "episode_030",
+   "episode_031",
+   "episode_032",
+   "episode_033",
+   "episode_034",
+   "episode_035",
+   "episode_036",
+   "episode_037",
+   "episode_038",
+   "episode_039",
+   "episode_040",
+   "episode_041",
+   "episode_042",
+   "episode_043",
+   "episode_044",
+   "episode_045",
+   "episode_046",
+   "episode_047",
+   "episode_048",
+   "episode_049"
+  ],
+  "heldout": [
+   "episode_050",
+   "episode_051",
+   "episode_052",
+   "episode_053",
+   "episode_054",
+   "episode_055",
+   "episode_056",
+   "episode_057",
+   "episode_058",
+   "episode_059",
+   "episode_060",
+   "episode_061",
+   "episode_062",
+   "episode_063",
+   "episode_064",
+   "episode_065",
+   "episode_066",
+   "episode_067",
+   "episode_068",
+   "episode_069",
+   "episode_070",
+   "episode_071",
+   "episode_072",
+   "episode_073",
+   "episode_074",
+   "episode_075",
+   "episode_076",
+   "episode_077",
+   "episode_078",
+   "episode_079",
+   "episode_080",
+   "episode_081",
+   "episode_082",
+   "episode_083",
+   "episode_084",
+   "episode_085",
+   "episode_086",
+   "episode_087",
+   "episode_088",
+   "episode_089",
+   "episode_090",
+   "episode_091",
+   "episode_092",
+   "episode_093",
+   "episode_094",
+   "episode_095",
+   "episode_096",
+   "episode_097",
+   "episode_098",
+   "episode_099"
+  ],
+  "heldout_use": "held-out demonstrations are reference only: never used for training, normalization statistics, augmentation fitting, checkpoint selection or hyperparameter selection"
+ },
+ "cache": {
+  "dir": "/common/users/im484/saga_benchmark/cache/footprint_margin",
+  "canonical_key_sha256": "801f9257e90dfd45349d046c7d765d67b3aa085e2075fb21f074882a1f64e506",
+  "schema": "footprint_margin_field_v3",
+  "files_sha256": {
+   "801f9257e90dfd45349d046c7d765d67b3aa085e2075fb21f074882a1f64e506.complete.json": "c33d4c744fece46efc8023b7d7ef632194c07a75ff364ce3117482561cca4fa0",
+   "801f9257e90dfd45349d046c7d765d67b3aa085e2075fb21f074882a1f64e506.npz": "70481ecde6f5f279e2d254dc71f85cd153a69df72c936d4b7634dab1a9b829ae",
+   "801f9257e90dfd45349d046c7d765d67b3aa085e2075fb21f074882a1f64e506.geometry.npz": "2a04aa11b3658c6ddb5cd0b7e36bebe901652d7d13764ae9259bf59a9c203794"
+  },
+  "combined_sha256": "84c1d4530fab44a0cdefec216ece03c1f7bc68c8b4e31c81a3622522c37e6e28",
+  "policy": "reused read-only; never rebuilt under this release"
+ },
+ "schema_version": "saga_spot_demo_v2",
+ "expert": {
+  "version": "expert_v3",
+  "expert_config": {
+   "seed": 0,
+   "base_backoff": 0.125,
+   "base_lateral": -0.08,
+   "hover_height": 0.1,
+   "ready_backoff": 0.1,
+   "object_center_site_x": 0.0053,
+   "lift": 0.1,
+   "retract": 0.05,
+   "release_drops": [
+    0.06,
+    0.09,
+    0.12
+   ],
+   "release_tilts": [
+    0.15,
+    0.0,
+    0.3
+   ],
+   "retract_candidates": [
+    [
+     0.15,
+     0.15
+    ],
+    [
+     0.2,
+     0.15
+    ],
+    [
+     0.15,
+     0.25
+    ],
+    [
+     0.1,
+     0.3
+    ]
+   ],
+   "min_final_distance": 0.25,
+   "approach_speed": 0.006,
+   "slow_speed": 0.002,
+   "transit_speed": 0.004,
+   "retract_speed": 0.004,
+   "position_gain": 0.5,
+   "rotation_gain": 0.3,
+   "position_cap": 0.3,
+   "rotation_cap": 0.1,
+   "max_slip_position": 0.02,
+   "max_slip_rotation": 0.3,
+   "max_steps_without_jaw_contact": 5,
+   "min_joint_margin": 0.05,
+   "min_arm_clearance": 0.003,
+   "min_gripper_clearance": 0.003,
+   "min_base_clearance": 0.05,
+   "plan_min_joint_margin": 0.1,
+   "plan_min_robot_clearance": 0.02,
+   "plan_min_robot_clearance_lift_off": 0.005,
+   "plan_min_can_clearance": 0.02,
+   "plan_spacing": 0.01,
+   "clearance_every": 5,
+   "settle_min_steps": 50,
+   "settle_max_steps": 150,
+   "stability_rule": "convergence",
+   "stability_max_step_slip": 0.0005,
+   "stability_max_step_rotation": 0.005,
+   "stability_consecutive": 8,
+   "stability_timeout": 100,
+   "stability_height_tolerance": 0.01,
+   "perturb_seed": -1,
+   "object_xy_noise": 0.02,
+   "base_xy_noise": 0.02,
+   "base_yaw_noise": 0.05
+  },
+  "nav_config": {
+   "start_distance_min": 1.4,
+   "start_distance_max": 2.4,
+   "start_candidates": 400,
+   "start_seed": 0,
+   "start_min_base_clearance": 0.15,
+   "start_min_robot_clearance": 0.1,
+   "start_mode": "far",
+   "far_bearing_halfwidth": 1.2,
+   "far_yaw_halfwidth": 1.5708,
+   "near_distance_min": 0.01,
+   "near_distance_max": 0.1,
+   "near_yaw": 0.15,
+   "near_min_base_clearance": 0.08,
+   "grid_resolution": 0.1,
+   "transit_clearance": 0.38,
+   "endpoint_clearance": 0.25,
+   "endpoint_radius": 0.45,
+   "max_speed": 0.25,
+   "max_yaw_rate": 0.6,
+   "position_gain": 1.2,
+   "yaw_gain": 1.5,
+   "waypoint_tolerance": 0.1,
+   "nav_position_tolerance": 0.01,
+   "nav_yaw_tolerance": 0.01,
+   "settle_speed": 0.002,
+   "follow_timeout": 1500,
+   "align_timeout": 300,
+   "settle_timeout": 100,
+   "min_base_clearance_nav": 0.04,
+   "min_arm_clearance_nav": 0.03,
+   "footprint_avoidance": false,
+   "avoid_horizon_steps": 10,
+   "avoid_buffer": 0.04,
+   "avoid_trigger": 0.3,
+   "rotate_first_yaw": 0.35,
+   "rotate_first_translation_scale": 0.25,
+   "avoid_stall_steps": 150,
+   "planner": "footprint_lattice",
+   "lattice_region": {
+    "x": [
+     0.09,
+     2.61
+    ],
+    "y": [
+     -4.03,
+     -1.14
+    ],
+    "yaw": [
+     -1.873,
+     1.869
+    ]
+   },
+   "lattice_cache_dir": "/common/users/im484/saga_benchmark/cache/footprint_margin",
+   "lattice_manifest_sha256": "a6f728dd8c93933b4a63a61034d3a7c0ff8f5e0f2ae6841be156b6cf136320bf",
+   "v3_speed_open": 0.15,
+   "v3_speed_mid": 0.1,
+   "v3_speed_low": 0.06,
+   "v3_yaw_rate_open": 0.4,
+   "v3_yaw_rate_mid": 0.3,
+   "v3_yaw_rate_low": 0.2,
+   "v3_horizon": 10,
+   "v3_horizon_low": 15,
+   "v3_waypoint_tolerance": 0.015,
+   "v3_yaw_tolerance": 0.02,
+   "v3_settle_speed": 0.01,
+   "v3_stall_steps": 60,
+   "v3_segment_timeout": 600,
+   "v3_fine_speed": 0.06,
+   "v3_fine_yaw_rate": 0.15,
+   "v3_fine_tolerance": 0.007,
+   "v3_fine_yaw_tolerance": 0.007,
+   "v3_fine_attempts": 12,
+   "v3_response_xy": 0.37,
+   "v3_response_yaw": 0.139,
+   "v3_base_action_frame": "controller",
+   "v3_translation_connectivity": 4,
+   "v3_recovery": true,
+   "v3_cross_track_limit": 0.02,
+   "v3_recovery_attempts": 3,
+   "v3_max_replans": 1,
+   "v3_correction_speed": 0.06,
+   "v3_navigation_budget": 2000
+  },
+  "navigation_budget_steps": 2000
+ },
+ "controller_calibration": {
+  "files": {
+   "controller_frame_calibration.json": {
+    "path": "saga_robocasa/config/controller_frame_calibration.json",
+    "sha256": "c457f5a5f387da9cd3167ed9c4ae44adec09dfb0504499922dce0ccfa4d15563"
+   },
+   "base_action_map.json": {
+    "path": "saga_robocasa/config/base_action_map.json",
+    "sha256": "2adf3bddb6c0c7a8fae4e071e275ac5358b1e600f5884d5bfdfe3f69e41f14ac"
+   },
+   "base_response.json": {
+    "path": "saga_robocasa/config/base_response.json",
+    "sha256": "f6bf6fda3f1a3e6598ad35f90a2efc8b874c65e894b103f63f5230173f59b030"
+   }
+  },
+  "source": "/common/users/im484/saga_benchmark/calibration/controller_frame_v2 (Slurm job 1304551)",
+  "controller_precondition": {
+   "controller": "MobileBaseJointVelocityController",
+   "impedance_mode": "fixed",
+   "interpolator": null,
+   "actuator_min": [
+    -1.0,
+    -1.0,
+    -1.5
+   ],
+   "actuator_max": [
+    1.0,
+    1.0,
+    1.5
+   ],
+   "joint_names": [
+    "leg0_joint_mobile_forward",
+    "leg0_joint_mobile_side",
+    "leg0_joint_mobile_yaw"
+   ],
+   "ok": true
+  },
+  "gates": {
+   "direction_error_deg": 2.0,
+   "speed_error_fraction": 0.1,
+   "inactive_qvel": 0.002,
+   "perpendicular_speed": 0.002,
+   "goal_agreement": 1e-05,
+   "stop_speed": 0.005,
+   "stop_steps": 15
+  },
+  "controller_mode": {
+   "gate_segments": 49,
+   "passed": 49,
+   "all_pass": true,
+   "direction_error_deg_range": [
+    0.00016468096362138836,
+    0.001112592859450358
+   ],
+   "speed_error_fraction_range": [
+    -8.54253069201838e-05,
+    -4.557219212233954e-05
+   ],
+   "active_goal_min_abs_range": [
+    0.32070936565237185,
+    0.3499999940395355
+   ],
+   "inactive_joint_max_abs_qvel_range": [
+    1.6966918998887608e-07,
+    5.861882400761118e-07
+   ],
+   "perpendicular_mean_abs_speed_range": [
+    1.7645948426903146e-06,
+    1.941710539909991e-06
+   ],
+   "goal_agreement_max_range": [
+    0.0,
+    0.0
+   ],
+   "steps_to_90pct_range": [
+    4,
+    4
+   ],
+   "stop_settle_steps_range": [
+    2,
+    2
+   ],
+   "stop_distance_m_range": [
+    0.001081665932423248,
+    0.0012294039076120866
+   ],
+   "change_old_axis_settle_steps_range": [
+    2,
+    2
+   ]
+  }
+ },
+ "cameras": {
+  "external": {
+   "id": "saga_external_v1",
+   "name": "saga_external",
+   "config": {
+    "pos": [
+     1.9833,
+     -2.8962,
+     1.8229
+    ],
+    "quat": [
+     0.81725,
+     0.491053,
+     -0.155342,
+     -0.258532
+    ],
+    "camera_attribs": {
+     "fovy": "60"
+    }
+   }
+  },
+  "wrist": {
+   "name": "robot0_eye_in_hand"
+  },
+  "image_size": [
+   128,
+   128
+  ],
+  "conventions": "RGB uint8 top-row-first; depth float32 metres along the optical axis; segmentation int16 geom id (-1 background), collision geoms and sites hidden; OpenCV intrinsics and camera-to-world extrinsics"
+ },
+ "control": {
+  "control_freq_hz": 20.0,
+  "robot": "SpotWithArmFloating",
+  "task": "robocasa/PickPlaceCounterToSink"
+ },
+ "success_and_safety": {
+  "navigation_gate": {
+   "position_m": 0.01,
+   "yaw_rad": 0.01,
+   "rule": "expert: NAV_ALIGN inside both tolerances, then NAV_SETTLE still inside them; policy evaluation: gate held for 10 consecutive steps"
+  },
+  "final_success": "RoboCasa PickPlaceCounterToSink._check_success() = obj_inside_of(sink, partial_check=True) and gripper_obj_far",
+  "expert_final_hold": {
+   "min_tcp_object_distance_m": 0.25,
+   "rule": "_check_success() True and TCP >= min distance, held 10 steps within 30"
+  },
+  "aborts": {
+   "min_joint_margin_rad": 0.05,
+   "min_arm_clearance_m": 0.003,
+   "min_gripper_clearance_m": 0.003,
+   "min_base_clearance_m": 0.05,
+   "navigation_min_base_clearance_m": 0.04,
+   "navigation_min_arm_clearance_m": 0.03,
+   "max_slip_position_m": 0.02,
+   "max_slip_rotation_rad": 0.3,
+   "unexpected_robot_contact": "abort",
+   "carried_object_scene_contact": "abort"
+  }
+ },
+ "navigation_safety": {
+  "planner_config": {
+   "resolution": 0.05,
+   "yaw_resolution": 0.1,
+   "buffer": 0.04,
+   "field_cap": 0.3,
+   "exact_cap": 0.5,
+   "low_clearance": 0.1,
+   "yaw_weight": 0.3,
+   "clearance_weight": 1.0,
+   "verify_step": 0.01,
+   "verify_yaw_step": 0.02,
+   "cache_tolerance": 0.01,
+   "snap_radius_cells": 2,
+   "translation_connectivity": 4
+  },
+  "nav_config_thresholds": {
+   "start_min_base_clearance": 0.15,
+   "start_min_robot_clearance": 0.1,
+   "near_min_base_clearance": 0.08,
+   "transit_clearance": 0.38,
+   "endpoint_clearance": 0.25,
+   "waypoint_tolerance": 0.1,
+   "nav_position_tolerance": 0.01,
+   "nav_yaw_tolerance": 0.01,
+   "min_base_clearance_nav": 0.04,
+   "min_arm_clearance_nav": 0.03,
+   "avoid_buffer": 0.04,
+   "v3_waypoint_tolerance": 0.015,
+   "v3_yaw_tolerance": 0.02,
+   "v3_fine_tolerance": 0.007,
+   "v3_fine_yaw_tolerance": 0.007
+  }
+ },
+ "audit": {
+  "run_root": "/common/users/im484/saga_benchmark/audit_v3_full_cf14133_20261121_155823",
+  "report": "/common/users/im484/saga_benchmark/audit_v3_full_cf14133_20261121_155823/audit_report.md",
+  "report_sha256": "c47ce7df2c1609c9a057b0bf93ea84c0d0717c52336482f78f5da16c4beb66ad",
+  "results": "/common/users/im484/saga_benchmark/audit_v3_full_cf14133_20261121_155823/audit_results.json",
+  "results_sha256": "e85249014b8bb0a05d7f4cb56fa6e9551534f4cffa393dedb8f0916e2282ad59",
+  "reused_smoke_root": "/common/users/im484/saga_benchmark/smoke_v3_cf14133_20261116_233533",
+  "reused_smoke_episodes": [
+   "episode_003",
+   "episode_007",
+   "episode_009",
+   "episode_032",
+   "episode_047",
+   "episode_050",
+   "episode_061",
+   "episode_065",
+   "episode_082",
+   "episode_087"
+  ],
+  "success": "100/100",
+  "train": "50/50",
+  "heldout": "50/50",
+  "aggregator_slurm_job": 1366235,
+  "episode_slurm_jobs": "1366144-1366234"
+ },
+ "problems": []
+}

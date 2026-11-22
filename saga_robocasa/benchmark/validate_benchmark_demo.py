@@ -42,6 +42,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmark import demo_schema as DS  # noqa: E402
 
 TOL_ARM = 1e-4
+OBJECT_FAR_M = 0.08          # object-labelled cloud point farther than this from the object origin = "far"
+OBJECT_FAR_MIN = 2           # a step fails only with at least this many far points ...
+OBJECT_FAR_FRACTION = 0.05   # ... and more than this fraction of its object points far
 
 
 def check_schema(arrays, meta):
@@ -217,14 +220,30 @@ def check_cameras(arrays, meta):
     top = projection["points"][0]
     out["object_top_in_view"] = bool(top["in_view"])
     out["object_top_surface_distance"] = top.get("surface_to_point_distance")
+    # Object-labelled cloud points near the object. Isolated edge pixels are tolerated: at gripper/object occlusion
+    # edges the frozen rig's multisampled depth and non-multisampled segmentation can disagree on one pixel (pilots
+    # 000/049: 1 of 3-9 object points, 0.08-0.19 m nearer the camera, during RELEASE_DESCEND). A step fails only if
+    # at least OBJECT_FAR_MIN points AND more than OBJECT_FAR_FRACTION of its object points are far.
     labels, cloud = arrays["obs_point_cloud_labels"], arrays["obs_point_cloud"]
-    dist = []
+    dist, far_steps, failing_steps, far_total, max_fraction = [], [], [], 0, 0.0
     for t in range(len(cloud)):
         pts = cloud[t][labels[t] == 1]
         if len(pts):
-            dist.append(float(np.linalg.norm(pts - arrays["obs_object_position"][t], axis=1).max()))
+            d = np.linalg.norm(pts - arrays["obs_object_position"][t], axis=1)
+            dist.append(float(d.max()))
+            far = int((d > OBJECT_FAR_M).sum())
+            if far:
+                far_total += far
+                far_steps.append(t)
+                max_fraction = max(max_fraction, far / len(pts))
+                if far >= OBJECT_FAR_MIN and far > OBJECT_FAR_FRACTION * len(pts):
+                    failing_steps.append(t)
     out["object_points_steps"] = len(dist)
     out["object_points_max_distance_m"] = max(dist) if dist else None
+    out["object_points_far_total"] = far_total
+    out["object_points_far_steps"] = far_steps
+    out["object_points_far_max_fraction"] = max_fraction
+    out["object_points_failing_steps"] = failing_steps
     for cam in ("external", "wrist"):
         if not (out[f"{cam}_intrinsics_constant"] and out[f"{cam}_extrinsics_max_orthonormality_error"] < 1e-5
                 and out[f"{cam}_extrinsics_bottom_row_ok"] and out[f"{cam}_depth_finite_positive"]):
@@ -235,8 +254,11 @@ def check_cameras(arrays, meta):
         problems.append("projection grid round trip")
     if not out["object_top_in_view"] or (out["object_top_surface_distance"] or 1.0) > 0.02:
         problems.append("object top centre not seen at its projected pixel at t=0")
-    if not dist or max(dist) > 0.08:
-        problems.append(f"object-labelled points not at the object ({out['object_points_max_distance_m']})")
+    if not dist:
+        problems.append("no object-labelled points at any step")
+    if failing_steps:
+        problems.append(f"object-labelled points not at the object at steps {failing_steps[:10]} "
+                        f"({len(failing_steps)} steps beyond isolated edge pixels)")
     return out, problems
 
 

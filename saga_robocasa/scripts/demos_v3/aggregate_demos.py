@@ -163,6 +163,8 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True):
                      "replay_first_divergence_step": replay.get("replay_first_divergence_step"),
                      "rendered_frames_compared": (replay.get("rendering") or {}).get("frames"),
                      "audit_events_equal": (validation.get("audit") or {}).get("events_equal"),
+                     "object_points_far_total": (validation.get("cameras") or {}).get("object_points_far_total"),
+                     "object_points_far_steps": len((validation.get("cameras") or {}).get("object_points_far_steps") or []),
                      "collection_tooling_commit": meta.get("collection_tooling_commit"),
                      "expert_behavior_commit": meta.get("expert_behavior_commit")})
     if specs:
@@ -191,7 +193,9 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True):
                        "heldout_transitions": int(sum(r["transitions"] for r in ok_rows if r["split"] == "heldout")),
                        "npz_bytes": int(sum(r["npz_bytes"] for r in ok_rows)),
                        "collection_wall_s": float(sum(r["collection_wall_s"] or 0 for r in ok_rows)),
-                       "validation_s": float(sum(r["validation_s"] or 0 for r in ok_rows))},
+                       "validation_s": float(sum(r["validation_s"] or 0 for r in ok_rows)),
+                       "object_points_far_total": int(sum(r["object_points_far_total"] or 0 for r in ok_rows)),
+                       "object_points_far_steps": int(sum(r["object_points_far_steps"] or 0 for r in ok_rows))},
             "episodes": rows}
 
 
@@ -222,7 +226,9 @@ def write_outputs(result, run_root):
              f"collection tooling {result['collection_tooling_commit']}, manifest {result['manifest_sha256']}", "",
              f"Transitions: {t['transitions']} (train {t['train_transitions']}, held-out {t['heldout_transitions']}); "
              f"storage {t['npz_bytes'] / 1e9:.2f} GB npz; collection {t['collection_wall_s'] / 3600:.2f} h, validation "
-             f"{t['validation_s'] / 3600:.2f} h", "", "## Problems", ""] + [f"- {p}" for p in result["problems"] or ["none"]] + [
+             f"{t['validation_s'] / 3600:.2f} h", "",
+             f"Tolerated isolated occlusion-edge cloud points (object-labelled, > 0.08 m from the object): "
+             f"{t['object_points_far_total']} points at {t['object_points_far_steps']} steps", "", "## Problems", ""] + [f"- {p}" for p in result["problems"] or ["none"]] + [
              "", "| episode | split | status | attempt | T | nav steps | MB | replay ok | audit events equal | host |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in result["episodes"]:

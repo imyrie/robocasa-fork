@@ -1,5 +1,5 @@
 """
-Offline tests of the v2 validator gates and the recording/validator provenance split (no simulator).
+Offline tests of the v2-introduced validator gates (still in force in v3) and the recording/validator provenance split (no simulator).
 
     python -m pytest -q saga_robocasa/benchmark/tests/test_validator_v2_offline.py
 """
@@ -76,44 +76,7 @@ def test_boundary_map_uses_the_stored_segmentation_neighbourhood():
     assert not V.boundary_adjacent(seg).any()            # image border is not a boundary by itself
 
 
-def test_small_boundary_only_rgb_noise_passes_and_is_reported():
-    seg, stored = two_region_segmentation(), noisy([])
-    stats = V.rgb_frame_stats(4, "external", noisy([(10, 63), (11, 64), (12, 63)], value=40), stored, seg)
-    assert stats == {"t": 4, "camera": "external", "pixels": 3, "off_boundary_pixels": 0, "max_channel_diff": 40}
-    assert V.rgb_frame_stats(5, "external", stored, stored, seg) is None
-    out, problems = V.rgb_gate([stats], PIXELS, frames_compared=600)
-    assert not problems
-    assert out["rgb_all_boundary_adjacent"] and out["rgb_mismatch_pixels_total"] == 3
-    assert out["rgb_worst_frame"]["t"] == 4 and out["rgb_max_frame_fraction"] == 3 / PIXELS
-    assert out["rgb_episode_fraction"] == 3 / (600 * PIXELS) and out["rgb_max_channel_diff_reported"] == 40
-
-
-def test_rgb_noise_away_from_a_boundary_fails():
-    seg = two_region_segmentation()
-    stats = V.rgb_frame_stats(4, "wrist", noisy([(10, 63), (10, 20)]), noisy([]), seg)
-    assert stats["off_boundary_pixels"] == 1
-    out, problems = V.rgb_gate([stats], PIXELS, frames_compared=600)
-    assert problems and not out["rgb_all_boundary_adjacent"]
-
-
-def test_excessive_per_frame_rgb_noise_fails():
-    seg = two_region_segmentation()
-    limit = int(V.RGB_MAX_FRAME_FRACTION * PIXELS)              # 32 of 16384 pixels
-    ok = V.rgb_frame_stats(1, "external", noisy([(v, 63) for v in range(limit)]), noisy([]), seg)
-    assert not V.rgb_gate([ok], PIXELS, frames_compared=10000)[1]
-    bad = V.rgb_frame_stats(1, "external", noisy([(v, 63) for v in range(limit)] + [(limit, 64)]), noisy([]), seg)
-    assert V.rgb_gate([bad], PIXELS, frames_compared=10000)[1]
-
-
-def test_excessive_episode_wide_rgb_noise_fails():
-    frames_compared = 600
-    allowed = int(V.RGB_MAX_EPISODE_FRACTION * frames_compared * PIXELS)   # 98 pixels over 600 frames
-    frame = lambda t, n: {"t": t, "camera": "external", "pixels": n, "off_boundary_pixels": 0, "max_channel_diff": 1}
-    within = [frame(t, 7) for t in range(allowed // 7)]
-    assert not V.rgb_gate(within, PIXELS, frames_compared)[1]
-    beyond = within + [frame(999, allowed - 7 * len(within) + 1)]
-    _, problems = V.rgb_gate(beyond, PIXELS, frames_compared)
-    assert any("of the episode" in p for p in problems)
+# (v3: the RGB acceptance tests live in test_validator_v3_offline.py; boundary adjacency is reported, not gated)
 
 
 @pytest.mark.parametrize("key", ["depth_mismatch_pixels", "segmentation_mismatch_pixels", "mask_mismatch_pixels",

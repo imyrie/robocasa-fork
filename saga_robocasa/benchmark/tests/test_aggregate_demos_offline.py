@@ -248,3 +248,41 @@ def test_v2_missing_revalidation_fails(root, monkeypatch):
     monkeypatch.setattr(AG, "VALIDATION_SUFFIX", "_validation_v2.json")
     result = AG.aggregate(root, [0, 1, 50], COMMIT, MANIFEST, validator_commit=VALIDATOR)
     assert not result["complete"] and any("episode_050" in p for p in result["problems"])
+
+
+# --------------------------------------------------------------------------- v3 re-validation (collector render order, bounded RGB)
+
+def revalidate_v3(root, index, rgb_pixels=0, top=0.003):
+    prefix = revalidate(root, index)                                   # v2 record (kept) ...
+    record = json.load(open(prefix + "_validation_v2.json"))
+    rgb = {"rgb_mismatch_pixels_total": rgb_pixels, "rgb_max_channel_diff": 1 if rgb_pixels else 0,
+           "rgb_mismatch_frames": 1 if rgb_pixels else 0, "rgb_episode_fraction": rgb_pixels / (6 * 16384),
+           "rgb_max_frame_fraction": rgb_pixels / 16384, "rgb_worst_frame": {"t": 119, "camera": "wrist", "pixels": rgb_pixels} if rgb_pixels else None,
+           "rgb_pixels_by_camera": {"wrist": rgb_pixels} if rgb_pixels else {}, "rgb_boundary_distance_min": 16 if rgb_pixels else None,
+           "rgb_boundary_distance_max": 16 if rgb_pixels else None, "rgb_geoms": {"wall_g0": rgb_pixels} if rgb_pixels else {}}
+    record.update(validator_version="v3", replay={"rgb": rgb}, cameras={"object_top_surface_distance": top})
+    json.dump(record, open(prefix + "_validation_v3.json", "w"))   # ... and a v3 record next to it
+    return prefix
+
+
+def test_v3_aggregation_summarizes_tolerated_differences_and_keeps_earlier_records(root, monkeypatch):
+    revalidate_v3(root, 0)
+    revalidate_v3(root, 1, rgb_pixels=1, top=0.0209)
+    revalidate_v3(root, 50)
+    before = {p: open(p).read() for p in __import__("glob").glob(os.path.join(root, "*", "attempt_1", "*_validation*.json"))
+              if not p.endswith("_v3.json")}
+    monkeypatch.setattr(AG, "VALIDATION_SUFFIX", "_validation_v3.json")
+    result = AG.aggregate(root, [0, 1, 50], COMMIT, MANIFEST, validator_commit=VALIDATOR)
+    assert result["complete"], result["problems"]
+    tol = result["tolerated"]
+    assert tol["rgb_episodes"] == ["episode_001"] and tol["rgb_pixels_total"] == 1 and tol["rgb_max_channel_diff"] == 1
+    assert tol["object_top_over_0_020_m"] == [["episode_001", 0.0209]] or tol["object_top_over_0_020_m"] == [("episode_001", 0.0209)]
+    assert tol["earlier_validation_records"]["validation"]["records"] == 3
+    assert tol["earlier_validation_records"]["validation_v2"]["passed"] == 3
+    AG.write_outputs(result, root, suffix="_v3")
+    report = open(os.path.join(root, "dataset_report_v3.md")).read()
+    assert "v1 (collection-time): 3/3 passed" in report and "v2: 3/3 passed" in report and "Tolerated differences" in report
+    for name in ("dataset_index_v3.json", "train_index_v3.json", "heldout_reference_index_v3.json", "SHA256SUMS_v3"):
+        assert os.path.exists(os.path.join(root, name))
+    assert not os.path.exists(os.path.join(root, "train_index.json"))
+    assert all(open(p).read() == text for p, text in before.items())   # v1 and v2 records untouched

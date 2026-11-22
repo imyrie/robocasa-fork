@@ -1,7 +1,7 @@
 #!/bin/bash
 # Re-validate existing immutable recordings with the current validator (no expert run, no re-collection).
 #
-#   revalidate_demos.sh --root RUN_ROOT --episodes all|"0 1 ..." --recording-commit COMMIT [--dry-run]
+#   revalidate_demos.sh --root RUN_ROOT --episodes all|"0 1 ..." --recording-commit COMMIT [--version v3] [--dry-run]
 #
 # - The checkout ~/projects/robocasa must be clean; its HEAD is the validator commit. Each validation writes
 #   <episode>_validation_<version>.json next to the recording and never overwrites a record (the original
@@ -11,13 +11,14 @@
 # - One aggregator job (afterany) over the requested episodes with --validation-version, requiring the
 #   recordings' collection commit (--recording-commit) and this validator commit; it fails unless all pass.
 set -euo pipefail
-ROOT="" EPISODES="" RECCOMMIT="" DRY=0 VERSION=v2
+ROOT="" EPISODES="" RECCOMMIT="" DRY=0 VERSION=v3
 while [ $# -gt 0 ]; do
   case "$1" in
     --root) ROOT=$2; shift 2;;
     --episodes) EPISODES=$2; shift 2;;
     --recording-commit) RECCOMMIT=$2; shift 2;;
     --dry-run) DRY=1; shift;;
+    --version) VERSION=$2; shift 2;;
     *) echo "unknown argument $1"; exit 2;;
   esac
 done
@@ -26,6 +27,7 @@ REPO=~/projects/robocasa
 cd "$REPO"
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "tracked tree dirty"; exit 2; }
 VALCOMMIT=$(git rev-parse HEAD)
+[ "$(sed -n 's/^VALIDATOR_VERSION = "\(.*\)"$/\1/p' saga_robocasa/benchmark/validate_benchmark_demo.py)" = "$VERSION" ] || { echo "--version $VERSION != the checkout's VALIDATOR_VERSION"; exit 2; }
 RECCOMMIT=$(git rev-parse "$RECCOMMIT")
 [ "$(sed -n 's/^collection_tooling_commit //p' "$ROOT/run_info.txt")" = "$RECCOMMIT" ] || { echo "run root was not recorded at $RECCOMMIT"; exit 2; }
 [ "$EPISODES" = all ] && EPISODES=$(seq -s ' ' 0 99)

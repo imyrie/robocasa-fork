@@ -156,6 +156,7 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True, validator_c
         stamps[eid] = {k: meta.get(k) for k in ("schema_version", "release_id", "manifest_sha256", "expert_behavior_commit",
                                                 "audit_tooling_commit", "collection_tooling_commit")}
         replay = validation.get("replay", {})
+        rgb = (replay or {}).get("rgb") or {}
         rows.append({"episode_id": eid, "index": index, "split": meta.get("split"), "status": "ok" if not issues else "invalid",
                      "attempt": n, "retries": n - 1, "path": os.path.relpath(prefix + ".npz", run_root),
                      "metadata": os.path.relpath(prefix + ".json", run_root), "npz_sha256": npz_sha, "json_sha256": json_sha,
@@ -165,8 +166,15 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True, validator_c
                      "validator_config_sha256": validation.get("validator_config_sha256"),
                      "original_validation_passed": (validation.get("original_validation") or {}).get("passed"),
                      "original_validation_problems": (validation.get("original_validation") or {}).get("problems"),
-                     "rgb_mismatch_pixels_total": ((validation.get("replay") or {}).get("rgb") or {}).get("rgb_mismatch_pixels_total"),
-                     "rgb_max_channel_diff": ((validation.get("replay") or {}).get("rgb") or {}).get("rgb_max_channel_diff"),
+                     "rgb_mismatch_pixels_total": rgb.get("rgb_mismatch_pixels_total"),
+                     "rgb_max_channel_diff": rgb.get("rgb_max_channel_diff"),
+                     "rgb_mismatch_frames": rgb.get("rgb_mismatch_frames"), "rgb_episode_fraction": rgb.get("rgb_episode_fraction"),
+                     "rgb_max_frame_fraction": rgb.get("rgb_max_frame_fraction"),
+                     "rgb_worst_frame": {k: (rgb.get("rgb_worst_frame") or {}).get(k) for k in ("t", "camera", "pixels")} if rgb.get("rgb_worst_frame") else None,
+                     "rgb_pixels_by_camera": rgb.get("rgb_pixels_by_camera"),
+                     "rgb_boundary_distance_min": rgb.get("rgb_boundary_distance_min"), "rgb_boundary_distance_max": rgb.get("rgb_boundary_distance_max"),
+                     "rgb_geoms": rgb.get("rgb_geoms"), "rgb_bodies": rgb.get("rgb_bodies"),
+                     "earlier_revalidations": earlier_revalidations(prefix),
                      "object_top_surface_distance": (validation.get("cameras") or {}).get("object_top_surface_distance"),
                      "transitions": meta.get("transitions"), "navigation_steps": meta.get("navigation_steps"),
                      "npz_bytes": os.path.getsize(prefix + ".npz"), "collection_wall_s": meta.get("wall_time_s"),
@@ -217,7 +225,59 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True, validator_c
                        "validation_s": float(sum(r["validation_s"] or 0 for r in ok_rows)),
                        "object_points_far_total": int(sum(r["object_points_far_total"] or 0 for r in ok_rows)),
                        "object_points_far_steps": int(sum(r["object_points_far_steps"] or 0 for r in ok_rows))},
-            "episodes": rows}
+            "tolerated": tolerated_summary(rows), "episodes": rows}
+
+
+def earlier_revalidations(prefix):
+    """Pass/fail of every OTHER validation record next to the recording (v1 original, earlier re-validations)."""
+    out = {}
+    for path in sorted(glob.glob(prefix + "_validation*.json")):
+        if path == prefix + VALIDATION_SUFFIX:
+            continue
+        name = os.path.basename(path)[len(os.path.basename(prefix)) + 1:-5]          # validation, validation_v2, ...
+        try:
+            record = json.load(open(path))
+        except (OSError, ValueError):
+            out[name] = {"readable": False}
+            continue
+        out[name] = {"passed": record.get("passed"), "validator_commit": record.get("validator_commit"),
+                     "sha256": DS.file_sha256(path), "problems": {k: v for k, v in (record.get("problems") or {}).items() if v}}
+    return out
+
+
+def tolerated_summary(rows):
+    """Differences the validator tolerated in the accepted episodes (object distance, cloud edge points, RGB)."""
+    ok = [r for r in rows if r.get("status") == "ok"]
+    rgb_rows = [r for r in ok if r.get("rgb_mismatch_pixels_total")]
+    geoms = {}
+    for r in rgb_rows:
+        for name, n in (r.get("rgb_geoms") or {}).items():
+            geoms[name] = geoms.get(name, 0) + n
+    mins = [r["rgb_boundary_distance_min"] for r in rgb_rows if r.get("rgb_boundary_distance_min") is not None]
+    maxs = [r["rgb_boundary_distance_max"] for r in rgb_rows if r.get("rgb_boundary_distance_max") is not None]
+    top = [(r["episode_id"], r["object_top_surface_distance"]) for r in ok if (r.get("object_top_surface_distance") or 0) > 0.020]
+    history = {}
+    for r in ok:
+        for name, rec in (r.get("earlier_revalidations") or {}).items():
+            h = history.setdefault(name, {"records": 0, "passed": 0, "failed": []})
+            h["records"] += 1
+            if rec.get("passed"):
+                h["passed"] += 1
+            else:
+                h["failed"].append(r["episode_id"])
+    return {"object_top_over_0_020_m": top, "object_top_max_m": max((r.get("object_top_surface_distance") or 0 for r in ok), default=None),
+            "object_points_far_total": int(sum(r.get("object_points_far_total") or 0 for r in ok)),
+            "object_points_far_steps": int(sum(r.get("object_points_far_steps") or 0 for r in ok)),
+            "object_points_far_episodes": sorted(r["episode_id"] for r in ok if r.get("object_points_far_total")),
+            "rgb_episodes": sorted(r["episode_id"] for r in rgb_rows),
+            "rgb_pixels_total": int(sum(r["rgb_mismatch_pixels_total"] for r in rgb_rows)),
+            "rgb_frames_total": int(sum(r.get("rgb_mismatch_frames") or 0 for r in rgb_rows)),
+            "rgb_max_channel_diff": max((r.get("rgb_max_channel_diff") or 0 for r in ok), default=0),
+            "rgb_max_frame_fraction": max((r.get("rgb_max_frame_fraction") or 0 for r in ok), default=0),
+            "rgb_max_episode_fraction": max((r.get("rgb_episode_fraction") or 0 for r in ok), default=0),
+            "rgb_boundary_distance_min": min(mins, default=None), "rgb_boundary_distance_max": max(maxs, default=None),
+            "rgb_geoms": dict(sorted(geoms.items(), key=lambda kv: -kv[1])),
+            "earlier_validation_records": history}
 
 
 def write_outputs(result, run_root, suffix=""):
@@ -251,7 +311,7 @@ def write_outputs(result, run_root, suffix=""):
              f"storage {t['npz_bytes'] / 1e9:.2f} GB npz; collection {t['collection_wall_s'] / 3600:.2f} h, validation "
              f"{t['validation_s'] / 3600:.2f} h", "",
              f"Tolerated isolated occlusion-edge cloud points (object-labelled, > 0.08 m from the object): "
-             f"{t['object_points_far_total']} points at {t['object_points_far_steps']} steps", "", "## Problems", ""] + [f"- {p}" for p in result["problems"] or ["none"]] + [
+             f"{t['object_points_far_total']} points at {t['object_points_far_steps']} steps", ""] + tolerated_lines(result) + ["## Problems", ""] + [f"- {p}" for p in result["problems"] or ["none"]] + [
              "", "| episode | split | status | attempt | T | nav steps | MB | replay ok | audit events equal | host |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in result["episodes"]:
@@ -259,6 +319,26 @@ def write_outputs(result, run_root, suffix=""):
                      f"{r.get('navigation_steps', '')} | {(r.get('npz_bytes') or 0) / 1e6:.1f} | {r.get('replay_check_success', '')} | "
                      f"{r.get('audit_events_equal', '')} | {(r.get('host') or '').split('.')[0]} |")
     open(os.path.join(run_root, f"dataset_report{suffix}.md"), "w").write("\n".join(lines) + "\n")
+
+
+def tolerated_lines(result):
+    tol = result.get("tolerated") or {}
+    if not tol:
+        return []
+    lines = ["## Tolerated differences (accepted episodes)", "",
+             f"- t=0 object top-centre distance > 0.020 m (gate 0.030 m): {len(tol['object_top_over_0_020_m'])} episodes "
+             + ", ".join(f"{e} {d:.4f} m" for e, d in tol["object_top_over_0_020_m"]) + f"; maximum {tol['object_top_max_m']}",
+             f"- isolated occlusion-edge object-labelled cloud points: {tol['object_points_far_total']} points at "
+             f"{tol['object_points_far_steps']} steps in {len(tol['object_points_far_episodes'])} episodes",
+             f"- RGB: {tol['rgb_pixels_total']} differing pixels in {tol['rgb_frames_total']} camera frames of "
+             f"{len(tol['rgb_episodes'])} episodes ({', '.join(tol['rgb_episodes']) or 'none'}); max channel difference "
+             f"{tol['rgb_max_channel_diff']}; max frame fraction {tol['rgb_max_frame_fraction']:.3g}; max episode fraction "
+             f"{tol['rgb_max_episode_fraction']:.3g}; boundary distance {tol['rgb_boundary_distance_min']}-{tol['rgb_boundary_distance_max']} px; "
+             f"geoms {tol['rgb_geoms']}", "", "## Earlier validation records (kept unchanged)", ""]
+    for name, h in sorted(tol["earlier_validation_records"].items()):
+        label = "v1 (collection-time)" if name == "validation" else name.replace("validation_", "")
+        lines.append(f"- {label}: {h['passed']}/{h['records']} passed" + (f"; failed {', '.join(h['failed'])}" if h["failed"] else ""))
+    return lines + [""]
 
 
 def main():

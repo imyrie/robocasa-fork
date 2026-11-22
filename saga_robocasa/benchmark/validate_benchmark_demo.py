@@ -21,11 +21,13 @@ Checks (all strict):
   policy       action_policy -> env inputs: arm (rotation into the OSC origin frame), base (controller-frame
                mapping, bit-exact from the float64 command, <=1e-5 from the float32 policy), gripper (exact).
   replay       fresh BenchmarkEpisode reset of the manifest entry (hash = manifest), recorded wrapper actions
-               replayed; qpos/qvel/act equal to the recording at EVERY step (exact), _check_success() True.
-  rendering    at every --every steps, every phase boundary, t=0 and t=T: both cameras re-rendered and compared
-               EXACTLY with the stored RGB, depth, segmentation, object/sink masks and point cloud (+labels);
-               raw segment IDs all mapped to drawn geoms of type mjOBJ_GEOM within ngeom (strict segmentation),
-               agreement with mujoco.Renderer's built-in decoder; stored segmentation values in [-1, ngeom).
+               replayed; qpos/qvel equal to the recording at EVERY step of both passes (exact), _check_success() True.
+  rendering    pass 1, in the collector's exact rendering sequence: EVERY frame of both cameras re-rendered;
+               depth, segmentation, object/sink masks and point cloud (+labels) compared EXACTLY; RGB gated (every
+               channel difference <= 1, <= 0.2% of a frame's and <= 0.001% of the episode's compared pixels; distance
+               to segmentation boundaries reported). Pass 2, a second replay afterwards, at every --every steps,
+               every phase boundary, t=0 and t=T: raw segment IDs all mapped to drawn geoms of type mjOBJ_GEOM within
+               ngeom (strict segmentation), built-in decoder equal to the stored segmentation.
   cameras      intrinsics constant and equal to the model's; external extrinsics constant and equal to the
                model's; wrist extrinsics rigid; projection grid round trip and t=0 object top-centre check;
                object-labelled point-cloud points near the object at every step.
@@ -45,7 +47,7 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmark import demo_schema as DS  # noqa: E402
 
-VALIDATOR_VERSION = "v2"
+VALIDATOR_VERSION = "v3"
 TOL_ARM = 1e-4
 OBJECT_FAR_M = 0.08          # object-labelled cloud point farther than this from the object origin = "far"
 OBJECT_FAR_MIN = 2           # a step fails only with at least this many far points ...
@@ -54,21 +56,28 @@ OBJECT_FAR_FRACTION = 0.05   # ... and more than this fraction of its object poi
 # and the back-projected surface point must lie within this distance (one 128-px pixel spans ~1.5 cm at ~1.7 m;
 # measured 0.021-0.023 m in episodes 015/021/022).
 OBJECT_TOP_MAX_M = 0.030
-# RGB re-render gate (approved v2 change). The episode_025 mismatch (15 px) did not reproduce in a full re-render
-# diagnosis (job 1369527: 2 x 1231 frames x 2 cameras, all bit-exact), so no channel bound is derived from it.
+# Rendering (v3). The RGB, depth and segmentation of both policy cameras are re-rendered in the COLLECTOR's exact
+# sequence (one external render for the projection check before t=0, then external, wrist at every frame); the
+# extra segmentation checks (raw segment IDs, built-in decoder) run afterwards in a separate replay. The v2
+# validator interleaved them between the external and wrist renders, which changed the wrist RGB of a stove-door
+# material by +-1 in 15-26 px of episodes 025/057/080 (diagnosis a1686bc: collector order reproduces the stored
+# frames, validator order reproduces the failures exactly, same GPU, all other data bit-exact). One isolated
+# interior +-1 single-channel pixel also occurred in 1 of 9 collector-order processes.
 # RGB may differ from the stored frame only if depth, segmentation, masks and point cloud are bit-exact (checked
-# separately), EVERY differing pixel is boundary-adjacent (its 3x3 neighbourhood in the STORED int16 geom-ID
-# segmentation, -1 = background, contains a different value; image-border pixels compare in-image neighbours only),
-# at most RGB_MAX_FRAME_FRACTION of a camera frame's pixels differ, and at most RGB_MAX_EPISODE_FRACTION of all
-# compared pixels of the episode differ. The maximum channel difference is reported, never gated.
+# separately), no channel differs by more than RGB_MAX_CHANNEL_DIFF anywhere (boundary or not), at most
+# RGB_MAX_FRAME_FRACTION of a camera frame's pixels differ, and at most RGB_MAX_EPISODE_FRACTION of all compared
+# pixels of the episode differ. Distance to the nearest segmentation boundary is reported, never gated.
+RGB_MAX_CHANNEL_DIFF = 1
 RGB_MAX_FRAME_FRACTION = 0.002
 RGB_MAX_EPISODE_FRACTION = 0.00001
+RGB_DETAIL_MAX = 64          # per frame: boundary distances / geoms reported for at most this many differing pixels
 VALIDATOR_CONFIG = {"version": VALIDATOR_VERSION, "tol_arm": TOL_ARM, "object_far_m": OBJECT_FAR_M,
                     "object_far_min": OBJECT_FAR_MIN, "object_far_fraction": OBJECT_FAR_FRACTION,
-                    "object_top_max_m": OBJECT_TOP_MAX_M, "rgb_max_frame_fraction": RGB_MAX_FRAME_FRACTION,
-                    "rgb_max_episode_fraction": RGB_MAX_EPISODE_FRACTION, "rgb_boundary": "3x3 neighbourhood of stored geom-ID segmentation",
-                    "rgb_channel_diff": "reported only", "exact": ["depth", "segmentation", "masks", "point_cloud", "state",
-                                                                   "controller_vectors"]}
+                    "object_top_max_m": OBJECT_TOP_MAX_M, "rgb_max_channel_diff": RGB_MAX_CHANNEL_DIFF,
+                    "rgb_max_frame_fraction": RGB_MAX_FRAME_FRACTION, "rgb_max_episode_fraction": RGB_MAX_EPISODE_FRACTION,
+                    "rgb_boundary_distance": "reported only (Chebyshev px to nearest different stored geom ID)",
+                    "render_order": "collector: external once, then external,wrist at every frame; segmentation checks in a second replay",
+                    "rgb_frames": "every frame", "exact": ["depth", "segmentation", "masks", "point_cloud", "state", "controller_vectors"]}
 
 
 def validator_config_hash():
@@ -108,14 +117,45 @@ def boundary_adjacent(segmentation):
     return near
 
 
-def rgb_frame_stats(t, camera, rendered_rgb, stored_rgb, stored_segmentation):
-    """None if the RGB frames are identical, else {t, camera, pixels, off_boundary_pixels, max_channel_diff}."""
-    diff = np.abs(rendered_rgb.astype(np.int16) - stored_rgb.astype(np.int16))
-    mask = diff.max(axis=-1) > 0
+def boundary_distance(segmentation, v, u):
+    """Chebyshev pixel distance from (v, u) to the nearest in-image pixel with a different segmentation value
+    (1 = boundary adjacent); None if the image has a single value."""
+    ys, xs = np.nonzero(segmentation != segmentation[v, u])
+    if len(ys) == 0:
+        return None
+    return int(np.maximum(np.abs(ys - v), np.abs(xs - u)).min())
+
+
+def geom_labels(model, geom):
+    """(geom name, body name) of a stored segmentation value (-1 background)."""
+    if geom < 0:
+        return ("background" if geom == -1 else f"segment{geom}"), None
+    if model is None:
+        return f"geom{geom}", None
+    body = int(model.geom_bodyid[geom])
+    return model.geom(geom).name or f"geom{geom}", model.body(body).name
+
+
+def rgb_frame_stats(t, camera, rendered_rgb, stored_rgb, stored_segmentation, model=None):
+    """None if the RGB frames are identical, else the frame's differing-pixel statistics."""
+    diff = np.abs(rendered_rgb.astype(np.int16) - stored_rgb.astype(np.int16)).max(axis=-1)
+    mask = diff > 0
     if not mask.any():
         return None
-    off = int((mask & ~boundary_adjacent(stored_segmentation)).sum())
-    return {"t": int(t), "camera": camera, "pixels": int(mask.sum()), "off_boundary_pixels": off, "max_channel_diff": int(diff.max())}
+    vs, us = np.nonzero(mask)
+    detail = list(zip(vs.tolist(), us.tolist()))[:RGB_DETAIL_MAX]
+    distances = [d for d in (boundary_distance(stored_segmentation, v, u) for v, u in detail) if d is not None]
+    geoms, bodies = {}, {}
+    for v, u in detail:
+        g, b = geom_labels(model, int(stored_segmentation[v, u]))
+        geoms[g] = geoms.get(g, 0) + 1
+        if b is not None:
+            bodies[b] = bodies.get(b, 0) + 1
+    return {"t": int(t), "camera": camera, "pixels": int(mask.sum()), "max_channel_diff": int(diff.max()),
+            "pixels_over_channel_limit": int((diff > RGB_MAX_CHANNEL_DIFF).sum()),
+            "boundary_distance_min": min(distances, default=None), "boundary_distance_max": max(distances, default=None),
+            "boundary_adjacent_pixels": int(sum(d == 1 for d in distances)), "detailed_pixels": len(detail),
+            "geoms": geoms, "bodies": bodies}
 
 
 def rgb_gate(frames, pixels_per_frame, frames_compared):
@@ -123,22 +163,46 @@ def rgb_gate(frames, pixels_per_frame, frames_compared):
     total = int(sum(f["pixels"] for f in frames))
     compared = frames_compared * pixels_per_frame
     worst = max(frames, key=lambda f: (f["pixels"], f["max_channel_diff"]), default=None)
+    by_camera, geoms, bodies = {}, {}, {}
+    for f in frames:
+        by_camera[f["camera"]] = by_camera.get(f["camera"], 0) + f["pixels"]
+        for key, store in (("geoms", geoms), ("bodies", bodies)):
+            for name, n in f.get(key, {}).items():
+                store[name] = store.get(name, 0) + n
+    mins = [f["boundary_distance_min"] for f in frames if f.get("boundary_distance_min") is not None]
+    maxs = [f["boundary_distance_max"] for f in frames if f.get("boundary_distance_max") is not None]
     out = {"rgb_mismatch_frames": len(frames), "rgb_frames_compared": frames_compared, "rgb_mismatch_pixels_total": total,
            "rgb_episode_fraction": total / compared if compared else 0.0,
            "rgb_worst_frame": worst, "rgb_max_frame_fraction": (worst["pixels"] / pixels_per_frame) if worst else 0.0,
-           "rgb_off_boundary_pixels": int(sum(f["off_boundary_pixels"] for f in frames)),
-           "rgb_all_boundary_adjacent": all(f["off_boundary_pixels"] == 0 for f in frames),
-           "rgb_max_channel_diff_reported": max((f["max_channel_diff"] for f in frames), default=0),
+           "rgb_max_channel_diff": max((f["max_channel_diff"] for f in frames), default=0),
+           "rgb_pixels_over_channel_limit": int(sum(f["pixels_over_channel_limit"] for f in frames)),
+           "rgb_pixels_by_camera": by_camera, "rgb_boundary_distance_min": min(mins, default=None),
+           "rgb_boundary_distance_max": max(maxs, default=None),
+           "rgb_boundary_adjacent_pixels": int(sum(f.get("boundary_adjacent_pixels", 0) for f in frames)),
+           "rgb_geoms": dict(sorted(geoms.items(), key=lambda kv: -kv[1])), "rgb_bodies": dict(sorted(bodies.items(), key=lambda kv: -kv[1])),
            "rgb_mismatch_frame_list": frames}
     problems = []
     for f in frames:
-        if f["off_boundary_pixels"]:
-            problems.append(f"RGB differs away from a segmentation boundary at t={f['t']} {f['camera']} ({f['off_boundary_pixels']} px)")
+        if f["max_channel_diff"] > RGB_MAX_CHANNEL_DIFF:
+            problems.append(f"RGB channel difference {f['max_channel_diff']} > {RGB_MAX_CHANNEL_DIFF} at t={f['t']} {f['camera']} "
+                            f"({f['pixels_over_channel_limit']} px)")
         if f["pixels"] > RGB_MAX_FRAME_FRACTION * pixels_per_frame:
             problems.append(f"RGB differs in {f['pixels']} px at t={f['t']} {f['camera']} (> {RGB_MAX_FRAME_FRACTION:.1%} of the frame)")
     if compared and total > RGB_MAX_EPISODE_FRACTION * compared:
         problems.append(f"RGB differs in {total} of {compared} compared pixels (> {RGB_MAX_EPISODE_FRACTION:.3%} of the episode)")
     return out, problems
+
+
+def collector_render_sequence(rig, cameras, frames, step, on_frame):
+    """The collector's rendering sequence (collect_benchmark_demo + Recorder.observe), nothing else rendered:
+    the external camera once (projection check) before t=0, then at every frame t both cameras back to back, in
+    `cameras` order, with step(t - 1) between frames. on_frame(t, camera, frame) only compares (never renders)."""
+    rig.render(cameras[0][1])
+    for t in range(frames):
+        if t > 0:
+            step(t - 1)
+        for camera, name in cameras:
+            on_frame(t, camera, rig.render(name))
 
 
 EXACT_RENDER_KEYS = ("depth_mismatch_pixels", "segmentation_mismatch_pixels", "mask_mismatch_pixels", "point_cloud_mismatches",
@@ -369,21 +433,31 @@ def check_cameras(arrays, meta):
     return out, problems
 
 
-def replay(arrays, meta, every, manifest):
-    import mujoco
-
-    import policy_cameras as PC
+def fresh_episode(manifest, meta):
     from benchmark.episodes import BenchmarkEpisode, params_from_entry, state_hash
-    from record_expert_demo import WRAPPER_KEYS, Recorder
-    from verify_segmentation import builtin_decoder, raw_segments
 
-    out, problems = {}, []
     entry = manifest["episodes"][meta["index"]]
     bench = BenchmarkEpisode()
-    start, nav_plan, report = bench.reset_to_spec(params_from_entry(entry))
-    raw_env, episode = bench.raw_env, bench.episode
+    bench.reset_to_spec(params_from_entry(entry))
+    return bench.raw_env, bench.episode, state_hash(bench.raw_env) == entry["initial_state_sha256"]
+
+
+def wrapper_action(arrays, t):
+    from record_expert_demo import WRAPPER_KEYS
+
+    return {key: arrays["action_wrapper_" + key.split(".")[1]][t] for key in WRAPPER_KEYS}
+
+
+def rendering_pass(arrays, meta, manifest):
+    """Pass 1: replay in the collector's rendering sequence. Every frame of both cameras is compared with the stored
+    RGB (gated), depth, segmentation, object/sink masks and point cloud (exact); physics state at every step and the
+    controller vector of every transition are compared exactly."""
+    import policy_cameras as PC
+    from record_expert_demo import Recorder
+
+    out = {}
+    raw_env, episode, out["reset_hash_match"] = fresh_episode(manifest, meta)
     model, data = raw_env.sim.model._model, raw_env.sim.data._data
-    out["reset_hash_match"] = state_hash(raw_env) == entry["initial_state_sha256"]
     rig = PC.CameraRig(raw_env, [PC.EXTERNAL_CAMERA, PC.WRIST_CAMERA], DS.IMAGE_SIZE, DS.IMAGE_SIZE)
     for cam, name in (("external", PC.EXTERNAL_CAMERA), ("wrist", PC.WRIST_CAMERA)):
         K, E = rig.calibration(name)
@@ -392,6 +466,7 @@ def replay(arrays, meta, every, manifest):
     out["external_extrinsics_equal_model"] = bool((E0.astype(np.float32) == arrays["obs_external_extrinsics"][0]).all())
     cloud_helper = Recorder(episode, rig, meta["cameras"]["point_cloud"]["workspace_center"],
                             meta["cameras"]["point_cloud"]["workspace_half_extent"], None)
+    obj_body, sink_bodies = raw_env.obj_body_id["obj"], cloud_helper.sink_bodies
     captured = []
     original_step = raw_env.step
 
@@ -399,34 +474,87 @@ def replay(arrays, meta, every, manifest):
         captured.append(np.array(env_action, dtype=np.float64))
         return original_step(env_action)
 
+    counts = {k: 0 for k in ("frames", "rgb_mismatch_pixels", "depth_mismatch_pixels", "segmentation_mismatch_pixels",
+                             "mask_mismatch_pixels", "point_cloud_mismatches", "invalid_decoded_pixels")}
+    state_dev = {"qpos": 0.0, "qvel": 0.0}
+    rgb_frames, first_divergence = [], [None]
+    out["initial_state_max_abs_diff"] = {"qpos": float(np.abs(data.qpos - arrays["obs_sim_qpos"][0]).max()),
+                                         "qvel": float(np.abs(data.qvel - arrays["obs_sim_qvel"][0]).max())}
+
+    def step(t):
+        episode.env.step(wrapper_action(arrays, t))
+        dq = float(np.abs(data.qpos - arrays["obs_sim_qpos"][t + 1]).max())
+        dv = float(np.abs(data.qvel - arrays["obs_sim_qvel"][t + 1]).max())
+        state_dev["qpos"], state_dev["qvel"] = max(state_dev["qpos"], dq), max(state_dev["qvel"], dv)
+        if first_divergence[0] is None and (dq or dv):
+            first_divergence[0] = t
+
+    def on_frame(t, cam, frame):
+        counts["frames"] += 1
+        stats = rgb_frame_stats(t, cam, frame["rgb"], arrays[f"obs_{cam}_rgb"][t], arrays[f"obs_{cam}_segmentation"][t], model)
+        if stats is not None:
+            counts["rgb_mismatch_pixels"] += stats["pixels"]
+            rgb_frames.append(stats)
+        counts["depth_mismatch_pixels"] += int((frame["depth"] != arrays[f"obs_{cam}_depth"][t]).sum())
+        seg = frame["segmentation"]
+        counts["segmentation_mismatch_pixels"] += int((seg.astype(np.int16) != arrays[f"obs_{cam}_segmentation"][t]).sum())
+        counts["invalid_decoded_pixels"] += int((seg == -2).sum())
+        counts["mask_mismatch_pixels"] += int((PC.geom_masks(model, seg, {obj_body}) != arrays[f"obs_{cam}_object_mask"][t]).sum()
+                                              + (PC.geom_masks(model, seg, sink_bodies) != arrays[f"obs_{cam}_sink_mask"][t]).sum())
+        if cam == "external":
+            K, E = rig.calibration(PC.EXTERNAL_CAMERA)
+            cloud_helper.obs = {"point_cloud": [None] * t}
+            cloud_helper._append_cloud(frame, K, E)
+            same = (np.array_equal(cloud_helper.obs["point_cloud"][-1], arrays["obs_point_cloud"][t])
+                    and np.array_equal(cloud_helper.obs["point_cloud_labels"][-1], arrays["obs_point_cloud_labels"][t])
+                    and np.array_equal(cloud_helper.obs["point_cloud_valid_count"][-1], arrays["obs_point_cloud_valid_count"][t]))
+            counts["point_cloud_mismatches"] += int(not same)
+
+    T = meta["transitions"]
     raw_env.step = capture
+    try:
+        collector_render_sequence(rig, (("external", PC.EXTERNAL_CAMERA), ("wrist", PC.WRIST_CAMERA)), T + 1, step, on_frame)
+    finally:
+        raw_env.step = original_step
+    out["replay_check_success"] = bool(raw_env._check_success())
+    out["replay_state_max_abs_diff"] = state_dev
+    out["replay_first_divergence_step"] = first_divergence[0]
+    out["replay_controller_vectors"] = len(captured)
+    out["replay_controller_mismatch_steps"] = int(sum(not np.array_equal(c, r) for c, r in zip(captured, arrays["action_controller_exact"])))
+    out["rendering"] = counts
+    out["ngeom"] = int(model.ngeom)
+    rig.close()
+    episode.close()
+    return out, rgb_frames
+
+
+def segmentation_pass(arrays, meta, every, manifest):
+    """Pass 2 (after every RGB frame was rendered): a second fresh replay, state checked exactly at every step; at
+    every --every steps, every phase boundary, t=0 and t=T, raw segment IDs are checked (all mapped to drawn geoms of
+    type mjOBJ_GEOM within ngeom) and mujoco.Renderer's built-in decoder is compared with the stored segmentation."""
+    import mujoco
+
+    import policy_cameras as PC
+    from verify_segmentation import builtin_decoder, raw_segments
+
+    out = {}
+    raw_env, episode, out["segmentation_pass_reset_hash_match"] = fresh_episode(manifest, meta)
+    model, data = raw_env.sim.model._model, raw_env.sim.data._data
+    rig = PC.CameraRig(raw_env, [PC.EXTERNAL_CAMERA, PC.WRIST_CAMERA], DS.IMAGE_SIZE, DS.IMAGE_SIZE)
     T = meta["transitions"]
     boundaries = set(np.flatnonzero(arrays["phase_transition"]).tolist())
     samples = sorted({0, T} | set(range(0, T + 1, every)) | boundaries | {b + 1 for b in boundaries if b + 1 <= T})
-    counts = {k: 0 for k in ("frames", "rgb_mismatch_pixels", "depth_mismatch_pixels", "segmentation_mismatch_pixels",
-                             "mask_mismatch_pixels", "point_cloud_mismatches", "unmapped_pixels", "non_geom_pixels",
-                             "out_of_range_ids", "invalid_decoded_pixels", "builtin_compared", "builtin_mismatch_pixels",
-                             "builtin_crashes")}
-    state_dev = {"qpos": 0.0, "qvel": 0.0, "act": 0.0}
-    rgb_frames = []
-    first_divergence = None
-    obj_body = raw_env.obj_body_id["obj"]
-    sink_bodies = cloud_helper.sink_bodies
-
-    def compare_frames(t):
+    counts = {k: 0 for k in ("segmentation_frames_checked", "unmapped_pixels", "non_geom_pixels", "out_of_range_ids",
+                             "builtin_compared", "builtin_mismatch_pixels", "builtin_crashes")}
+    divergent = 0
+    for t in range(T + 1):
+        if t > 0:
+            episode.env.step(wrapper_action(arrays, t - 1))
+            divergent += int(not (np.array_equal(data.qpos, arrays["obs_sim_qpos"][t]) and np.array_equal(data.qvel, arrays["obs_sim_qvel"][t])))
+        if t not in samples:
+            continue
         for cam, name in (("external", PC.EXTERNAL_CAMERA), ("wrist", PC.WRIST_CAMERA)):
-            frame = rig.render(name)
-            counts["frames"] += 1
-            stats = rgb_frame_stats(t, cam, frame["rgb"], arrays[f"obs_{cam}_rgb"][t], arrays[f"obs_{cam}_segmentation"][t])
-            if stats is not None:
-                counts["rgb_mismatch_pixels"] += stats["pixels"]
-                rgb_frames.append(stats)
-            counts["depth_mismatch_pixels"] += int((frame["depth"] != arrays[f"obs_{cam}_depth"][t]).sum())
-            seg = frame["segmentation"]
-            counts["segmentation_mismatch_pixels"] += int((seg.astype(np.int16) != arrays[f"obs_{cam}_segmentation"][t]).sum())
-            counts["invalid_decoded_pixels"] += int((seg == -2).sum())
-            counts["mask_mismatch_pixels"] += int((PC.geom_masks(model, seg, {obj_body}) != arrays[f"obs_{cam}_object_mask"][t]).sum()
-                                                  + (PC.geom_masks(model, seg, sink_bodies) != arrays[f"obs_{cam}_sink_mask"][t]).sum())
+            counts["segmentation_frames_checked"] += 1
             segid, drawn, _ = raw_segments(rig, name)
             ids = np.unique(segid)
             unmapped = [int(i) for i in ids if i != 0 and i not in drawn]
@@ -435,56 +563,43 @@ def replay(arrays, meta, every, manifest):
             counts["non_geom_pixels"] += int(np.isin(segid, non_geom).sum())
             counts["out_of_range_ids"] += sum(1 for i in ids if i in drawn and drawn[i][0] == mujoco.mjtObj.mjOBJ_GEOM
                                               and not 0 <= drawn[i][1] < model.ngeom)
-            builtin, crash = builtin_decoder(model, data, name, rig.option, DS.IMAGE_SIZE)
+            builtin, _ = builtin_decoder(model, data, name, rig.option, DS.IMAGE_SIZE)
             if builtin is None:
                 counts["builtin_crashes"] += 1
             else:
                 counts["builtin_compared"] += 1
-                counts["builtin_mismatch_pixels"] += int((builtin != seg).sum())
-            if cam == "external":
-                K, E = rig.calibration(name)
-                cloud_helper.obs = {"point_cloud": [None] * t}
-                cloud_helper._append_cloud(frame, K, E)
-                same = (np.array_equal(cloud_helper.obs["point_cloud"][-1], arrays["obs_point_cloud"][t])
-                        and np.array_equal(cloud_helper.obs["point_cloud_labels"][-1], arrays["obs_point_cloud_labels"][t])
-                        and np.array_equal(cloud_helper.obs["point_cloud_valid_count"][-1], arrays["obs_point_cloud_valid_count"][t]))
-                counts["point_cloud_mismatches"] += int(not same)
-
-    initial = {"qpos": float(np.abs(data.qpos - arrays["obs_sim_qpos"][0]).max()),
-               "qvel": float(np.abs(data.qvel - arrays["obs_sim_qvel"][0]).max())}
-    out["initial_state_max_abs_diff"] = initial
-    if 0 in samples:
-        compare_frames(0)
-    for t in range(T):
-        action = {key: arrays["action_wrapper_" + key.split(".")[1]][t] for key in WRAPPER_KEYS}
-        episode.env.step(action)
-        dq = float(np.abs(data.qpos - arrays["obs_sim_qpos"][t + 1]).max())
-        dv = float(np.abs(data.qvel - arrays["obs_sim_qvel"][t + 1]).max())
-        state_dev["qpos"], state_dev["qvel"] = max(state_dev["qpos"], dq), max(state_dev["qvel"], dv)
-        if first_divergence is None and (dq or dv):
-            first_divergence = t
-        if t + 1 in samples:
-            compare_frames(t + 1)
-    raw_env.step = original_step
-    out["replay_check_success"] = bool(raw_env._check_success())
-    out["replay_state_max_abs_diff"] = state_dev
-    out["replay_first_divergence_step"] = first_divergence
-    out["replay_controller_vectors"] = len(captured)
-    out["replay_controller_mismatch_steps"] = int(sum(not np.array_equal(c, r) for c, r in zip(captured, arrays["action_controller_exact"])))
-    out["rendering"] = counts
-    out["sampled_steps"] = len(samples)
+                counts["builtin_mismatch_pixels"] += int((builtin.astype(np.int16) != arrays[f"obs_{cam}_segmentation"][t]).sum())
+    out["segmentation_pass_divergent_steps"] = divergent
+    out["segmentation_sampled_steps"] = len(samples)
     rig.close()
     episode.close()
-    if not out["reset_hash_match"]:
+    return out, counts
+
+
+def replay(arrays, meta, every, manifest):
+    out, problems = {}, []
+    render_out, rgb_frames = rendering_pass(arrays, meta, manifest)
+    seg_out, seg_counts = segmentation_pass(arrays, meta, every, manifest)   # only after every RGB frame is rendered
+    out.update(render_out)
+    out.update(seg_out)
+    counts = dict(render_out["rendering"], **seg_counts)
+    out["rendering"] = counts
+    out["sampled_steps"] = seg_out["segmentation_sampled_steps"]
+    T = meta["transitions"]
+    if not out["reset_hash_match"] or not out["segmentation_pass_reset_hash_match"]:
         problems.append("replay reset hash differs from the manifest")
-    if initial["qpos"] or initial["qvel"]:
-        problems.append(f"initial state differs {initial}")
-    if first_divergence is not None:
-        problems.append(f"replay diverges at step {first_divergence} ({state_dev})")
-    if len(captured) != T or out["replay_controller_mismatch_steps"]:
-        problems.append(f"controller vectors: {len(captured)} captured, {out['replay_controller_mismatch_steps']} mismatching")
+    if out["initial_state_max_abs_diff"]["qpos"] or out["initial_state_max_abs_diff"]["qvel"]:
+        problems.append(f"initial state differs {out['initial_state_max_abs_diff']}")
+    if out["replay_first_divergence_step"] is not None:
+        problems.append(f"replay diverges at step {out['replay_first_divergence_step']} ({out['replay_state_max_abs_diff']})")
+    if out["segmentation_pass_divergent_steps"]:
+        problems.append(f"segmentation-pass replay diverges at {out['segmentation_pass_divergent_steps']} steps")
+    if out["replay_controller_vectors"] != T or out["replay_controller_mismatch_steps"]:
+        problems.append(f"controller vectors: {out['replay_controller_vectors']} captured, {out['replay_controller_mismatch_steps']} mismatching")
     if not out["replay_check_success"]:
         problems.append("replay _check_success() False")
+    if counts["frames"] != 2 * (T + 1):
+        problems.append(f"rendered {counts['frames']} camera frames, expected {2 * (T + 1)}")
     problems += exact_render_problems(counts)
     out["rgb"], rgb_problems = rgb_gate(rgb_frames, DS.IMAGE_SIZE * DS.IMAGE_SIZE, counts["frames"])
     problems += rgb_problems
@@ -493,7 +608,6 @@ def replay(arrays, meta, every, manifest):
     for key in ("external_intrinsics_equal_model", "wrist_intrinsics_equal_model", "external_extrinsics_equal_model"):
         if not out[key]:
             problems.append(key)
-    out["ngeom"] = int(model.ngeom)
     return out, problems
 
 

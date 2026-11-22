@@ -1,6 +1,10 @@
 """
 Validate ONE saga_spot_demo_v2 demonstration (collect_benchmark_demo.py) and replay it. Writes
-<episode_id>_validation.json next to the demonstration; exit 0 only if every check passes.
+<episode_id>_validation_<VALIDATOR_VERSION>.json next to the demonstration (never overwriting an existing validation
+record; the original collection-time <episode_id>_validation.json is kept as evidence); exit 0 only if every check
+passes. Recording provenance (expert / collection-tool commit) and validator provenance (validator commit, version,
+config sha256) are recorded separately: a later validator may validate an older immutable recording only if the
+recording-defining files and the schema are unchanged (demo_schema.recording_compatibility).
 
     python -u saga_robocasa/benchmark/validate_benchmark_demo.py /common/users/.../episode_000/attempt_1/episode_000
 
@@ -41,10 +45,108 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmark import demo_schema as DS  # noqa: E402
 
+VALIDATOR_VERSION = "v2"
 TOL_ARM = 1e-4
 OBJECT_FAR_M = 0.08          # object-labelled cloud point farther than this from the object origin = "far"
 OBJECT_FAR_MIN = 2           # a step fails only with at least this many far points ...
 OBJECT_FAR_FRACTION = 0.05   # ... and more than this fraction of its object points far
+# t=0 object top-centre check (approved v2 change, was 0.020 m): the projected pixel must show the target object
+# and the back-projected surface point must lie within this distance (one 128-px pixel spans ~1.5 cm at ~1.7 m;
+# measured 0.021-0.023 m in episodes 015/021/022).
+OBJECT_TOP_MAX_M = 0.030
+# RGB re-render gate (approved v2 change). The episode_025 mismatch (15 px) did not reproduce in a full re-render
+# diagnosis (job 1369527: 2 x 1231 frames x 2 cameras, all bit-exact), so no channel bound is derived from it.
+# RGB may differ from the stored frame only if depth, segmentation, masks and point cloud are bit-exact (checked
+# separately), EVERY differing pixel is boundary-adjacent (its 3x3 neighbourhood in the STORED int16 geom-ID
+# segmentation, -1 = background, contains a different value; image-border pixels compare in-image neighbours only),
+# at most RGB_MAX_FRAME_FRACTION of a camera frame's pixels differ, and at most RGB_MAX_EPISODE_FRACTION of all
+# compared pixels of the episode differ. The maximum channel difference is reported, never gated.
+RGB_MAX_FRAME_FRACTION = 0.002
+RGB_MAX_EPISODE_FRACTION = 0.00001
+VALIDATOR_CONFIG = {"version": VALIDATOR_VERSION, "tol_arm": TOL_ARM, "object_far_m": OBJECT_FAR_M,
+                    "object_far_min": OBJECT_FAR_MIN, "object_far_fraction": OBJECT_FAR_FRACTION,
+                    "object_top_max_m": OBJECT_TOP_MAX_M, "rgb_max_frame_fraction": RGB_MAX_FRAME_FRACTION,
+                    "rgb_max_episode_fraction": RGB_MAX_EPISODE_FRACTION, "rgb_boundary": "3x3 neighbourhood of stored geom-ID segmentation",
+                    "rgb_channel_diff": "reported only", "exact": ["depth", "segmentation", "masks", "point_cloud", "state",
+                                                                   "controller_vectors"]}
+
+
+def validator_config_hash():
+    import hashlib
+
+    return hashlib.sha256(json.dumps(VALIDATOR_CONFIG, sort_keys=True).encode()).hexdigest()
+
+
+def object_top_problems(projection, stored_object_mask_t0):
+    """t=0 check: object top centre projects onto the target object (stored mask) within OBJECT_TOP_MAX_M."""
+    top = projection["points"][0]
+    out = {"object_top_in_view": bool(top["in_view"]), "object_top_surface_distance": top.get("surface_to_point_distance"),
+           "object_top_geom": top.get("geom"), "object_top_max_m": OBJECT_TOP_MAX_M}
+    on_object = False
+    if top["in_view"]:
+        u, v = top["pixel_uv"]
+        on_object = bool(stored_object_mask_t0[int(round(v)), int(round(u))])
+    out["object_top_pixel_on_object"] = on_object
+    problems = []
+    if not on_object or top.get("surface_to_point_distance") is None or top["surface_to_point_distance"] > OBJECT_TOP_MAX_M:
+        problems.append(f"object top centre not seen at its projected pixel at t=0 (on object {on_object}, "
+                        f"distance {top.get('surface_to_point_distance')})")
+    return out, problems
+
+
+def boundary_adjacent(segmentation):
+    """Pixels whose 3x3 neighbourhood (in-image neighbours only) contains a different segmentation value."""
+    h, w = segmentation.shape
+    near = np.zeros((h, w), dtype=bool)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == dx == 0:
+                continue
+            ys, yd = slice(max(dy, 0), h + min(dy, 0)), slice(max(-dy, 0), h + min(-dy, 0))
+            xs, xd = slice(max(dx, 0), w + min(dx, 0)), slice(max(-dx, 0), w + min(-dx, 0))
+            near[yd, xd] |= segmentation[ys, xs] != segmentation[yd, xd]
+    return near
+
+
+def rgb_frame_stats(t, camera, rendered_rgb, stored_rgb, stored_segmentation):
+    """None if the RGB frames are identical, else {t, camera, pixels, off_boundary_pixels, max_channel_diff}."""
+    diff = np.abs(rendered_rgb.astype(np.int16) - stored_rgb.astype(np.int16))
+    mask = diff.max(axis=-1) > 0
+    if not mask.any():
+        return None
+    off = int((mask & ~boundary_adjacent(stored_segmentation)).sum())
+    return {"t": int(t), "camera": camera, "pixels": int(mask.sum()), "off_boundary_pixels": off, "max_channel_diff": int(diff.max())}
+
+
+def rgb_gate(frames, pixels_per_frame, frames_compared):
+    """frames: rgb_frame_stats of the compared frames whose RGB differs; frames_compared: camera frames compared."""
+    total = int(sum(f["pixels"] for f in frames))
+    compared = frames_compared * pixels_per_frame
+    worst = max(frames, key=lambda f: (f["pixels"], f["max_channel_diff"]), default=None)
+    out = {"rgb_mismatch_frames": len(frames), "rgb_frames_compared": frames_compared, "rgb_mismatch_pixels_total": total,
+           "rgb_episode_fraction": total / compared if compared else 0.0,
+           "rgb_worst_frame": worst, "rgb_max_frame_fraction": (worst["pixels"] / pixels_per_frame) if worst else 0.0,
+           "rgb_off_boundary_pixels": int(sum(f["off_boundary_pixels"] for f in frames)),
+           "rgb_all_boundary_adjacent": all(f["off_boundary_pixels"] == 0 for f in frames),
+           "rgb_max_channel_diff_reported": max((f["max_channel_diff"] for f in frames), default=0),
+           "rgb_mismatch_frame_list": frames}
+    problems = []
+    for f in frames:
+        if f["off_boundary_pixels"]:
+            problems.append(f"RGB differs away from a segmentation boundary at t={f['t']} {f['camera']} ({f['off_boundary_pixels']} px)")
+        if f["pixels"] > RGB_MAX_FRAME_FRACTION * pixels_per_frame:
+            problems.append(f"RGB differs in {f['pixels']} px at t={f['t']} {f['camera']} (> {RGB_MAX_FRAME_FRACTION:.1%} of the frame)")
+    if compared and total > RGB_MAX_EPISODE_FRACTION * compared:
+        problems.append(f"RGB differs in {total} of {compared} compared pixels (> {RGB_MAX_EPISODE_FRACTION:.3%} of the episode)")
+    return out, problems
+
+
+EXACT_RENDER_KEYS = ("depth_mismatch_pixels", "segmentation_mismatch_pixels", "mask_mismatch_pixels", "point_cloud_mismatches",
+                     "unmapped_pixels", "non_geom_pixels", "out_of_range_ids", "invalid_decoded_pixels", "builtin_mismatch_pixels")
+
+
+def exact_render_problems(counts):
+    return [f"rendering: {key} = {counts[key]}" for key in EXACT_RENDER_KEYS if counts.get(key)]
 
 
 def check_schema(arrays, meta):
@@ -73,6 +175,7 @@ def check_schema(arrays, meta):
 
 
 def check_provenance(meta, prefix, manifest):
+    """Recording provenance (immutable evidence) and compatibility with this validator. Returns problems."""
     problems = []
     expected = {"schema_version": DS.SCHEMA_VERSION, "release_id": DS.RELEASE_ID, "manifest_sha256": DS.MANIFEST_SHA256,
                 "expert_behavior_commit": DS.EXPERT_BEHAVIOR_COMMIT, "audit_tooling_commit": DS.AUDIT_TOOLING_COMMIT,
@@ -90,9 +193,15 @@ def check_provenance(meta, prefix, manifest):
         problems.append("file name differs from the episode id")
     if meta["attempt"] != 1 and not meta.get("retry_of"):
         problems.append("retry without retry provenance")
-    head = DS.git("rev-parse", "HEAD")
-    if meta["collection_tooling_commit"] != head:
-        problems.append(f"collected at {meta['collection_tooling_commit']}, validating at {head}")
+    compatible, details = DS.recording_compatibility(meta["collection_tooling_commit"])
+    if not compatible:
+        problems.append(f"recording at {meta['collection_tooling_commit']} is not validatable by this validator: {details}")
+    # recorded data unchanged since collection: npz vs its collection-time sha256; json vs the original validation
+    original = prefix + "_validation.json"
+    if os.path.isfile(original):
+        recorded_json = json.load(open(original)).get("files", {}).get("json_sha256")
+        if recorded_json and DS.file_sha256(prefix + ".json") != recorded_json:
+            problems.append("metadata json changed since its original validation")
     if DS.expert_behavior_diff():
         problems.append("validator checkout: expert-behaviour files differ from the expert commit")
     if DS.file_sha256(prefix + ".npz") != meta["npz_sha256"]:
@@ -217,9 +326,8 @@ def check_cameras(arrays, meta):
     projection = meta["cameras"]["projection_validation"]
     out["projection_grid_pixel_error"] = projection["grid_max_pixel_error"]
     out["projection_grid_depth_error"] = projection["grid_max_depth_error"]
-    top = projection["points"][0]
-    out["object_top_in_view"] = bool(top["in_view"])
-    out["object_top_surface_distance"] = top.get("surface_to_point_distance")
+    top_out, top_problems = object_top_problems(projection, arrays["obs_external_object_mask"][0])
+    out.update(top_out)
     # Object-labelled cloud points near the object. Isolated edge pixels are tolerated: at gripper/object occlusion
     # edges the frozen rig's multisampled depth and non-multisampled segmentation can disagree on one pixel (pilots
     # 000/049: 1 of 3-9 object points, 0.08-0.19 m nearer the camera, during RELEASE_DESCEND). A step fails only if
@@ -252,8 +360,7 @@ def check_cameras(arrays, meta):
         problems.append("external camera moved")
     if projection["grid_max_pixel_error"] > 1e-3 or projection["grid_max_depth_error"] > 1e-4:
         problems.append("projection grid round trip")
-    if not out["object_top_in_view"] or (out["object_top_surface_distance"] or 1.0) > 0.02:
-        problems.append("object top centre not seen at its projected pixel at t=0")
+    problems += top_problems
     if not dist:
         problems.append("no object-labelled points at any step")
     if failing_steps:
@@ -301,6 +408,7 @@ def replay(arrays, meta, every, manifest):
                              "out_of_range_ids", "invalid_decoded_pixels", "builtin_compared", "builtin_mismatch_pixels",
                              "builtin_crashes")}
     state_dev = {"qpos": 0.0, "qvel": 0.0, "act": 0.0}
+    rgb_frames = []
     first_divergence = None
     obj_body = raw_env.obj_body_id["obj"]
     sink_bodies = cloud_helper.sink_bodies
@@ -309,7 +417,10 @@ def replay(arrays, meta, every, manifest):
         for cam, name in (("external", PC.EXTERNAL_CAMERA), ("wrist", PC.WRIST_CAMERA)):
             frame = rig.render(name)
             counts["frames"] += 1
-            counts["rgb_mismatch_pixels"] += int(np.any(frame["rgb"] != arrays[f"obs_{cam}_rgb"][t], axis=-1).sum())
+            stats = rgb_frame_stats(t, cam, frame["rgb"], arrays[f"obs_{cam}_rgb"][t], arrays[f"obs_{cam}_segmentation"][t])
+            if stats is not None:
+                counts["rgb_mismatch_pixels"] += stats["pixels"]
+                rgb_frames.append(stats)
             counts["depth_mismatch_pixels"] += int((frame["depth"] != arrays[f"obs_{cam}_depth"][t]).sum())
             seg = frame["segmentation"]
             counts["segmentation_mismatch_pixels"] += int((seg.astype(np.int16) != arrays[f"obs_{cam}_segmentation"][t]).sum())
@@ -374,11 +485,9 @@ def replay(arrays, meta, every, manifest):
         problems.append(f"controller vectors: {len(captured)} captured, {out['replay_controller_mismatch_steps']} mismatching")
     if not out["replay_check_success"]:
         problems.append("replay _check_success() False")
-    for key in ("rgb_mismatch_pixels", "depth_mismatch_pixels", "segmentation_mismatch_pixels", "mask_mismatch_pixels",
-                "point_cloud_mismatches", "unmapped_pixels", "non_geom_pixels", "out_of_range_ids", "invalid_decoded_pixels",
-                "builtin_mismatch_pixels"):
-        if counts[key]:
-            problems.append(f"rendering: {key} = {counts[key]}")
+    problems += exact_render_problems(counts)
+    out["rgb"], rgb_problems = rgb_gate(rgb_frames, DS.IMAGE_SIZE * DS.IMAGE_SIZE, counts["frames"])
+    problems += rgb_problems
     if counts["builtin_compared"] == 0:
         problems.append("built-in segmentation decoder never compared")
     for key in ("external_intrinsics_equal_model", "wrist_intrinsics_equal_model", "external_extrinsics_equal_model"):
@@ -419,15 +528,47 @@ def main():
     parser.add_argument("prefix", help="<attempt dir>/<episode_id> (no extension)")
     parser.add_argument("--every", type=int, default=10, help="re-render spacing (plus every phase boundary)")
     args = parser.parse_args()
+    out_path = f"{args.prefix}_validation_{VALIDATOR_VERSION}.json"
+    if os.path.exists(out_path):
+        print(f"VALIDATION REFUSED: {out_path} exists (validation records are never overwritten)")
+        return 2
     started = time.time()
     manifest = json.load(open(os.path.join(DS.repo_root(), DS.MANIFEST_RELPATH)))
     meta = json.load(open(args.prefix + ".json"))
+    validator_commit = DS.git("rev-parse", "HEAD")
+    compatible, compatibility = DS.recording_compatibility(meta.get("collection_tooling_commit", ""), validator_commit)
     result = {"episode_id": meta.get("episode_id"), "split": meta.get("split"), "schema_version": DS.SCHEMA_VERSION,
-              "validator_commit": DS.git("rev-parse", "HEAD"), "problems": {}}
+              "validator_version": VALIDATOR_VERSION, "validator_commit": validator_commit,
+              "validator_dirty": bool(DS.git("status", "--porcelain", "--untracked-files=no")),
+              "validator_config": VALIDATOR_CONFIG, "validator_config_sha256": validator_config_hash(),
+              "recording_provenance": {k: meta.get(k) for k in ("expert_behavior_commit", "collection_tooling_commit",
+                                                                "collection_tooling_dirty", "audit_tooling_commit", "schema_version",
+                                                                "release_id", "manifest_sha256", "npz_sha256", "host", "gpu",
+                                                                "slurm_job_id", "attempt", "retry_of")},
+              "provenance": {
+                  "expert_behavior_commit": meta.get("expert_behavior_commit"),
+                  "recording_commit": meta.get("collection_tooling_commit"),
+                  "recorder_camera_schema_commit": (DS.last_commit_touching(meta["collection_tooling_commit"], DS.RECORDER_CAMERA_SCHEMA_FILES)
+                                                    if compatible else None),
+                  "validator_commit": validator_commit, "validator_config_sha256": validator_config_hash()},
+              "recording_files": {"npz_sha256": DS.file_sha256(args.prefix + ".npz"), "json_sha256": DS.file_sha256(args.prefix + ".json"),
+                                  "original_validation_sha256": DS.file_sha256(args.prefix + "_validation.json")
+                                  if os.path.isfile(args.prefix + "_validation.json") else None,
+                                  "npz_sha256_recorded_at_collection": meta.get("npz_sha256")},
+              "recording_compatibility": {"compatible": compatible, **compatibility},
+              "original_validation": None, "problems": {}}
+    if os.path.isfile(args.prefix + "_validation.json"):
+        original = json.load(open(args.prefix + "_validation.json"))
+        result["original_validation"] = {"path": os.path.basename(args.prefix) + "_validation.json",
+                                         "sha256": DS.file_sha256(args.prefix + "_validation.json"),
+                                         "passed": original.get("passed"), "validator_commit": original.get("validator_commit"),
+                                         "problems": {k: v for k, v in original.get("problems", {}).items() if v}}
     import platform
 
     result["host"] = platform.node()
     problems = check_provenance(meta, args.prefix, manifest)
+    if result["validator_dirty"]:
+        problems.append("validator checkout has uncommitted tracked changes")
     result["problems"]["provenance"] = problems
     try:
         with np.load(args.prefix + ".npz") as archive:
@@ -458,9 +599,9 @@ def main():
                                                  "manifest_sha256", "release_id", "attempt", "retry_of")}
     result["validation_seconds"] = time.time() - started
     result["passed"] = arrays is not None and all(not v for v in result["problems"].values()) and "replay" in result
-    with open(args.prefix + "_validation.json.partial", "w") as file:
+    with open(out_path + ".partial", "w") as file:
         json.dump(result, file, indent=1, default=float)
-    os.replace(args.prefix + "_validation.json.partial", args.prefix + "_validation.json")
+    os.replace(out_path + ".partial", out_path)
     print("VALIDATION", json.dumps({"episode": result["episode_id"], "passed": result["passed"],
                                     "problems": {k: v for k, v in result["problems"].items() if v}}))
     return 0 if result["passed"] else 1

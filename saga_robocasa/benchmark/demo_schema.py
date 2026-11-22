@@ -184,3 +184,60 @@ def validated_and_matching(prefix, head):
     if wrong:
         return False, f"stamps differ: {wrong}"
     return True, "validated and matching"
+
+
+# --------------------------------------------------------------------------- recording vs validator provenance
+# A recording is immutable evidence made at its collection-tool commit. A LATER validator may validate it only if
+# everything that defines the recording is unchanged between that commit and the validator's commit: the expert
+# and environment (EXPERT_BEHAVIOR_FILES, which include the cameras policy_cameras.py, the recorder
+# record_expert_demo.py, the episodes and manifests), the collector, and the schema content (fingerprint). The
+# validator commit itself need not equal the recording commit; both are recorded.
+RECORDING_FILES = EXPERT_BEHAVIOR_FILES + ("saga_robocasa/benchmark/collect_benchmark_demo.py",)
+
+
+def schema_fingerprint(namespace=None):
+    """sha256 of the schema content (version, required arrays with dtypes/shapes, required metadata)."""
+    import hashlib
+    import json
+
+    ns = namespace or globals()
+    content = {"schema_version": ns["SCHEMA_VERSION"],
+               "required_arrays": {k: [v[0], None if v[1] is None else list(v[1])] for k, v in ns["REQUIRED_ARRAYS"].items()},
+               "required_metadata": list(ns["REQUIRED_METADATA"])}
+    return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
+def schema_fingerprint_at(commit, root=None):
+    """Schema fingerprint of demo_schema.py as it was at `commit` (the module's constants only)."""
+    source = git("show", f"{commit}:saga_robocasa/benchmark/demo_schema.py", root=root)
+    namespace = {"__file__": os.path.join(repo_root(), "saga_robocasa", "benchmark", "demo_schema.py")}
+    exec(compile(source, f"demo_schema@{commit[:10]}", "exec"), namespace)
+    return schema_fingerprint(namespace)
+
+
+def recording_compatibility(recording_commit, validator_commit=None, root=None, diff_names=None, fingerprint_at=None):
+    """
+    (ok, details): may a validator at validator_commit validate a recording made at recording_commit?
+    diff_names(a, b, paths) and fingerprint_at(commit) are injectable for tests.
+    """
+    validator_commit = validator_commit or git("rev-parse", "HEAD", root=root)
+    diff_names = diff_names or (lambda a, b, paths: [n for n in git("diff", "--name-only", a, b, "--", *paths, root=root).splitlines() if n])
+    fingerprint_at = fingerprint_at or (lambda c: schema_fingerprint_at(c, root=root))
+    try:
+        changed = diff_names(recording_commit, validator_commit, RECORDING_FILES)
+        recording_schema, validator_schema = fingerprint_at(recording_commit), fingerprint_at(validator_commit)
+    except subprocess.CalledProcessError as error:
+        return False, {"error": f"git: {error}"}
+    details = {"recording_commit": recording_commit, "validator_commit": validator_commit,
+               "same_commit": recording_commit == validator_commit, "changed_recording_files": changed,
+               "schema_fingerprint_recording": recording_schema, "schema_fingerprint_validator": validator_schema}
+    return (not changed and recording_schema == validator_schema), details
+
+
+RECORDER_CAMERA_SCHEMA_FILES = ("saga_robocasa/record_expert_demo.py", "saga_robocasa/policy_cameras.py",
+                                "saga_robocasa/benchmark/collect_benchmark_demo.py", "saga_robocasa/benchmark/demo_schema.py")
+
+
+def last_commit_touching(commit, paths, root=None):
+    """The latest commit at or before `commit` that changed any of `paths` (provenance of the recorder/cameras/schema)."""
+    return git("log", "-1", "--format=%H", commit, "--", *paths, root=root)

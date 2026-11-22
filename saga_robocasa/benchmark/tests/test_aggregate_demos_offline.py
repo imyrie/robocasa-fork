@@ -184,3 +184,67 @@ def test_resume_check_skips_only_validated_matching_outputs(root):
         file.write(" ")
     ok, why = DS.validated_and_matching(prefix, COMMIT)
     assert not ok and "json sha256" in why
+
+
+# --------------------------------------------------------------------------- v2 re-validation (validator-only commit)
+
+VALIDATOR = "v" * 40
+
+
+def revalidate(root, index, validator=VALIDATOR, compatible=True, passed=True, config="cfg"):
+    """Write a v2 validation record for an existing recording, keeping the original record untouched."""
+    eid = DS.episode_id(index)
+    prefix = os.path.join(root, eid, "attempt_1", eid)
+    original = json.load(open(prefix + "_validation.json"))
+    record = dict(original, passed=passed, validator_commit=validator, validator_version="v2", validator_config_sha256=config,
+                  recording_compatibility={"compatible": compatible, "recording_commit": COMMIT, "validator_commit": validator},
+                  original_validation={"passed": original["passed"], "problems": {}})
+    json.dump(record, open(prefix + "_validation_v2.json", "w"))
+    return prefix
+
+
+def test_v2_revalidation_with_a_later_validator_is_accepted_and_recorded(root, monkeypatch):
+    for i in (0, 1, 50):
+        revalidate(root, i)
+    monkeypatch.setattr(AG, "VALIDATION_SUFFIX", "_validation_v2.json")
+    result = AG.aggregate(root, [0, 1, 50], COMMIT, MANIFEST, validator_commit=VALIDATOR)
+    assert result["complete"], result["problems"]
+    assert result["recording_provenance"]["collection_tooling_commit"] == COMMIT
+    assert result["validator_provenance"]["validator_commit"] == VALIDATOR
+    assert all(r["validator_commit"] == VALIDATOR and r["original_validation_passed"] for r in result["episodes"])
+    AG.write_outputs(result, root, suffix="_v2")
+    assert os.path.exists(os.path.join(root, "train_index_v2.json")) and not os.path.exists(os.path.join(root, "train_index.json"))
+
+
+def test_v2_original_failed_records_are_kept_and_reported(tmp_path, monkeypatch):
+    r = str(tmp_path)
+    for i in (0, 1):
+        make_episode(r, i)
+    make_episode(r, 2, passed=False)
+    original = open(os.path.join(r, "episode_002", "attempt_1", "episode_002_validation.json")).read()
+    for i in (0, 1, 2):
+        revalidate(r, i)
+    monkeypatch.setattr(AG, "VALIDATION_SUFFIX", "_validation_v2.json")
+    result = AG.aggregate(r, [0, 1, 2], COMMIT, MANIFEST, validator_commit=VALIDATOR)
+    assert result["complete"], result["problems"]
+    assert [x["original_validation_passed"] for x in result["episodes"]] == [True, True, False]
+    assert open(os.path.join(r, "episode_002", "attempt_1", "episode_002_validation.json")).read() == original
+
+
+def test_v2_mixed_or_unverified_validators_fail(root, monkeypatch):
+    revalidate(root, 0)
+    revalidate(root, 1, config="other")
+    revalidate(root, 50, compatible=False)
+    monkeypatch.setattr(AG, "VALIDATION_SUFFIX", "_validation_v2.json")
+    result = AG.aggregate(root, [0, 1, 50], COMMIT, MANIFEST, validator_commit=VALIDATOR)
+    assert not result["complete"]
+    assert any("episode_050" in p and "compatibility" in p for p in result["problems"])
+    assert any("different validators/configs" in p for p in result["problems"])
+
+
+def test_v2_missing_revalidation_fails(root, monkeypatch):
+    revalidate(root, 0)
+    revalidate(root, 1)
+    monkeypatch.setattr(AG, "VALIDATION_SUFFIX", "_validation_v2.json")
+    result = AG.aggregate(root, [0, 1, 50], COMMIT, MANIFEST, validator_commit=VALIDATOR)
+    assert not result["complete"] and any("episode_050" in p for p in result["problems"])

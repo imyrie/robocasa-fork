@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 from benchmark import demo_schema as DS  # noqa: E402
 
 ATTEMPT_RE = re.compile(r"^attempt_(\d+)$")
+VALIDATION_SUFFIX = "_validation.json"   # "_validation_v2.json" with --validation-version v2 (main sets it)
 
 
 def classify_attempt(directory, eid):
@@ -40,9 +41,9 @@ def classify_attempt(directory, eid):
     files = sorted(os.listdir(directory))
     if os.path.isfile(prefix + "_failure.json"):
         return "expert_failure", prefix
-    if os.path.isfile(prefix + "_validation.json"):
+    if os.path.isfile(prefix + VALIDATION_SUFFIX):
         try:
-            passed = json.load(open(prefix + "_validation.json")).get("passed")
+            passed = json.load(open(prefix + VALIDATION_SUFFIX)).get("passed")
         except ValueError:
             return "corrupt_validation", prefix
         return ("validated" if passed else "validation_failed"), prefix
@@ -51,10 +52,11 @@ def classify_attempt(directory, eid):
     return "empty", prefix
 
 
-def verify_validated(prefix, commit, manifest, decompress=True):
+def verify_validated(prefix, commit, manifest, decompress=True, validator_commit=None):
+    """commit: the recording's collection-tool commit; validator_commit: required validator commit (default = commit)."""
     problems = []
     meta = json.load(open(prefix + ".json"))
-    validation = json.load(open(prefix + "_validation.json"))
+    validation = json.load(open(prefix + VALIDATION_SUFFIX))
     npz_sha, json_sha = DS.file_sha256(prefix + ".npz"), DS.file_sha256(prefix + ".json")
     if npz_sha != validation["files"]["npz_sha256"] or npz_sha != meta.get("npz_sha256"):
         problems.append("npz sha256 mismatch")
@@ -87,8 +89,11 @@ def verify_validated(prefix, commit, manifest, decompress=True):
     for key, value in frozen.items():
         if meta.get(key) != value:
             problems.append(f"{key} {meta.get(key)!r} != {value!r}")
-    if validation.get("validator_commit") != commit:
-        problems.append(f"validator commit {validation.get('validator_commit')} != {commit}")
+    expected_validator = validator_commit or commit
+    if validation.get("validator_commit") != expected_validator:
+        problems.append(f"validator commit {validation.get('validator_commit')} != {expected_validator}")
+    if expected_validator != commit and not (validation.get("recording_compatibility") or {}).get("compatible"):
+        problems.append("validator did not establish compatibility with the recording")
     entry = manifest["episodes"][meta.get("index", -1)] if 0 <= meta.get("index", -1) < len(manifest["episodes"]) else None
     if entry is None or entry["episode_id"] != meta.get("episode_id") or entry["split"] != meta.get("split") \
             or meta.get("initial_state_sha256") != entry["initial_state_sha256"]:
@@ -96,7 +101,7 @@ def verify_validated(prefix, commit, manifest, decompress=True):
     return problems, meta, validation, spec, npz_sha, json_sha
 
 
-def aggregate(run_root, episodes, commit, manifest, decompress=True):
+def aggregate(run_root, episodes, commit, manifest, decompress=True, validator_commit=None):
     problems, rows, retries = [], [], []
     requested = {DS.episode_id(i) for i in episodes}
     present = {os.path.basename(p) for p in glob.glob(os.path.join(run_root, "episode_*")) if os.path.isdir(p)}
@@ -139,7 +144,7 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True):
             if m != n and c not in ("expert_failure", "validation_failed", "incomplete", "empty"):
                 problems.append(f"{eid}: attempt_{m} is {c}")
         try:
-            issues, meta, validation, spec, npz_sha, json_sha = verify_validated(prefix, commit, manifest, decompress)
+            issues, meta, validation, spec, npz_sha, json_sha = verify_validated(prefix, commit, manifest, decompress, validator_commit)
         except (OSError, ValueError, KeyError) as error:
             problems.append(f"{eid}: unreadable ({error})")
             rows.append({"episode_id": eid, "status": "unreadable"})
@@ -154,7 +159,15 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True):
         rows.append({"episode_id": eid, "index": index, "split": meta.get("split"), "status": "ok" if not issues else "invalid",
                      "attempt": n, "retries": n - 1, "path": os.path.relpath(prefix + ".npz", run_root),
                      "metadata": os.path.relpath(prefix + ".json", run_root), "npz_sha256": npz_sha, "json_sha256": json_sha,
-                     "validation_sha256": DS.file_sha256(prefix + "_validation.json"),
+                     "validation_file": os.path.relpath(prefix + VALIDATION_SUFFIX, run_root),
+                     "validation_sha256": DS.file_sha256(prefix + VALIDATION_SUFFIX),
+                     "validator_commit": validation.get("validator_commit"), "validator_version": validation.get("validator_version"),
+                     "validator_config_sha256": validation.get("validator_config_sha256"),
+                     "original_validation_passed": (validation.get("original_validation") or {}).get("passed"),
+                     "original_validation_problems": (validation.get("original_validation") or {}).get("problems"),
+                     "rgb_mismatch_pixels_total": ((validation.get("replay") or {}).get("rgb") or {}).get("rgb_mismatch_pixels_total"),
+                     "rgb_max_channel_diff": ((validation.get("replay") or {}).get("rgb") or {}).get("rgb_max_channel_diff"),
+                     "object_top_surface_distance": (validation.get("cameras") or {}).get("object_top_surface_distance"),
                      "transitions": meta.get("transitions"), "navigation_steps": meta.get("navigation_steps"),
                      "npz_bytes": os.path.getsize(prefix + ".npz"), "collection_wall_s": meta.get("wall_time_s"),
                      "validation_s": validation.get("validation_seconds"), "host": meta.get("host"), "gpu": meta.get("gpu"),
@@ -174,6 +187,10 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True):
                 problems.append(f"{eid}: array keys/dtypes/shapes differ from {reference_eid}")
         if len({json.dumps(s, sort_keys=True) for s in stamps.values()}) != 1:
             problems.append("stamps differ between episodes")
+        validators = {(r.get("validator_commit"), r.get("validator_version"), r.get("validator_config_sha256"))
+                      for r in rows if r.get("status") == "ok"}
+        if len(validators) > 1:
+            problems.append(f"episodes validated by different validators/configs: {sorted(validators)}")
     ok_rows = [r for r in rows if r.get("status") == "ok"]
     train = [r["episode_id"] for r in ok_rows if r["split"] == "train"]
     heldout = [r["episode_id"] for r in ok_rows if r["split"] == "heldout"]
@@ -186,6 +203,10 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True):
     return {"run_root": run_root, "release_id": DS.RELEASE_ID, "schema_version": DS.SCHEMA_VERSION,
             "expert_behavior_commit": DS.EXPERT_BEHAVIOR_COMMIT, "audit_tooling_commit": DS.AUDIT_TOOLING_COMMIT,
             "collection_tooling_commit": commit, "manifest_sha256": DS.MANIFEST_SHA256, "requested": len(episodes),
+            "recording_provenance": {"expert_behavior_commit": DS.EXPERT_BEHAVIOR_COMMIT, "collection_tooling_commit": commit},
+            "validator_provenance": {"validator_commit": validator_commit or commit, "validation_file_suffix": VALIDATION_SUFFIX,
+                                     "validator_versions_and_configs": sorted({(r.get("validator_version") or "v1", r.get("validator_config_sha256") or "")
+                                                                               for r in rows if r.get("status") == "ok"})},
             "validated": len(ok_rows), "train": train, "heldout": heldout, "retries": retries, "problems": problems,
             "array_spec": specs[sorted(specs)[0]] if specs else None, "complete": complete,
             "totals": {"transitions": int(sum(r["transitions"] for r in ok_rows)),
@@ -199,31 +220,33 @@ def aggregate(run_root, episodes, commit, manifest, decompress=True):
             "episodes": rows}
 
 
-def write_outputs(result, run_root):
+def write_outputs(result, run_root, suffix=""):
+    """suffix (e.g. "_v2") names a re-validation's outputs so the earlier ones are kept."""
     def index(split):
         return {k: result[k] for k in ("release_id", "schema_version", "expert_behavior_commit", "audit_tooling_commit",
                                        "collection_tooling_commit", "manifest_sha256")} | {
             "split": split, "episodes": [r for r in result["episodes"] if r.get("status") == "ok" and (split == "all" or r["split"] == split)]}
 
-    json.dump(result, open(os.path.join(run_root, "dataset_index.json"), "w"), indent=1)
+    json.dump(result, open(os.path.join(run_root, f"dataset_index{suffix}.json"), "w"), indent=1)
     if result["complete"]:
         train = index("train")
         train["note"] = "training, normalization statistics, augmentation fitting, checkpoint and hyperparameter selection: this index ONLY"
-        json.dump(train, open(os.path.join(run_root, "train_index.json"), "w"), indent=1)
+        json.dump(train, open(os.path.join(run_root, f"train_index{suffix}.json"), "w"), indent=1)
         heldout = index("heldout")
         heldout["note"] = "held-out REFERENCE demonstrations: never used for training, statistics, augmentation, checkpoint or hyperparameter selection"
-        json.dump(heldout, open(os.path.join(run_root, "heldout_reference_index.json"), "w"), indent=1)
-        with open(os.path.join(run_root, "SHA256SUMS"), "w") as file:
+        json.dump(heldout, open(os.path.join(run_root, f"heldout_reference_index{suffix}.json"), "w"), indent=1)
+        with open(os.path.join(run_root, f"SHA256SUMS{suffix}"), "w") as file:
             for r in sorted(result["episodes"], key=lambda r: r["episode_id"]):
-                prefix = r["path"][:-4]
                 file.write(f"{r['npz_sha256']}  {r['path']}\n{r['json_sha256']}  {r['metadata']}\n"
-                           f"{r['validation_sha256']}  {prefix}_validation.json\n")
+                           f"{r['validation_sha256']}  {r['validation_file']}\n")
     t = result["totals"]
     lines = [f"# Demonstration dataset {result['release_id']} ({result['schema_version']})", "",
              f"Complete: {result['complete']}; validated {result['validated']}/{result['requested']} "
              f"(train {len(result['train'])}, held-out {len(result['heldout'])}); retries {len(result['retries'])}", "",
              f"Expert behaviour commit {result['expert_behavior_commit']}, audit tooling {result['audit_tooling_commit']}, "
              f"collection tooling {result['collection_tooling_commit']}, manifest {result['manifest_sha256']}", "",
+             f"Validator: commit {result['validator_provenance']['validator_commit']}, records *{result['validator_provenance']['validation_file_suffix']}, "
+             f"version/config {result['validator_provenance']['validator_versions_and_configs']}", "",
              f"Transitions: {t['transitions']} (train {t['train_transitions']}, held-out {t['heldout_transitions']}); "
              f"storage {t['npz_bytes'] / 1e9:.2f} GB npz; collection {t['collection_wall_s'] / 3600:.2f} h, validation "
              f"{t['validation_s'] / 3600:.2f} h", "",
@@ -235,15 +258,20 @@ def write_outputs(result, run_root):
         lines.append(f"| {r['episode_id']} | {r.get('split', '')} | {r.get('status')} | {r.get('attempt', '')} | {r.get('transitions', '')} | "
                      f"{r.get('navigation_steps', '')} | {(r.get('npz_bytes') or 0) / 1e6:.1f} | {r.get('replay_check_success', '')} | "
                      f"{r.get('audit_events_equal', '')} | {(r.get('host') or '').split('.')[0]} |")
-    open(os.path.join(run_root, "dataset_report.md"), "w").write("\n".join(lines) + "\n")
+    open(os.path.join(run_root, f"dataset_report{suffix}.md"), "w").write("\n".join(lines) + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--episodes", nargs="+", required=True, help="indices or 'all'")
-    parser.add_argument("--commit", required=True, help="collection tooling commit the dataset must be stamped with")
+    parser.add_argument("--commit", required=True, help="collection tooling commit the recordings must be stamped with")
+    parser.add_argument("--validation-version", default=None, help="e.g. v2: read <episode>_validation_v2.json records")
+    parser.add_argument("--validator-commit", default=None, help="validator commit required in the records (default: --commit)")
     args = parser.parse_args()
+    global VALIDATION_SUFFIX
+    if args.validation_version:
+        VALIDATION_SUFFIX = f"_validation_{args.validation_version}.json"
     episodes = list(range(100)) if args.episodes == ["all"] else sorted({int(x) for x in args.episodes})
     manifest_bytes = subprocess.check_output(["git", "-C", DS.repo_root(), "show", f"{DS.EXPERT_BEHAVIOR_COMMIT}:{DS.MANIFEST_RELPATH}"])
     import hashlib
@@ -251,8 +279,10 @@ def main():
     if hashlib.sha256(manifest_bytes).hexdigest() != DS.MANIFEST_SHA256:
         print("manifest checksum mismatch")
         return 2
-    result = aggregate(args.run_root, episodes, args.commit, json.loads(manifest_bytes))
-    write_outputs(result, args.run_root)
+    validator_commit = subprocess.check_output(["git", "-C", DS.repo_root(), "rev-parse", args.validator_commit]).decode().strip() \
+        if args.validator_commit else None
+    result = aggregate(args.run_root, episodes, args.commit, json.loads(manifest_bytes), validator_commit=validator_commit)
+    write_outputs(result, args.run_root, suffix=f"_{args.validation_version}" if args.validation_version else "")
     print("DATASET", json.dumps({k: result[k] for k in ("requested", "validated", "complete", "retries", "totals")}))
     for p in result["problems"]:
         print("PROBLEM", p)

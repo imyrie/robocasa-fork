@@ -169,7 +169,10 @@ class DemoDataset(Dataset):
                 keep = np.ones(T, dtype=bool)
             if not keep.any():
                 continue
-            if meta.get("recovery"):
+            name = meta.get("name") or meta["episode_id"]   # saga_spot_demo_v2 metadata names the manifest episode
+            if meta.get("schema_version") == "saga_spot_demo_v2":
+                source = "benchmark_" + meta["split"]
+            elif meta.get("recovery"):
                 source = meta["recovery"].get("kind", "manipulation_recovery")
             elif meta.get("navigation") and meta["navigation"].get("restored_from"):
                 source = "recovery"
@@ -191,9 +194,9 @@ class DemoDataset(Dataset):
             proprio = np.concatenate(proprio_parts, axis=1).astype(np.float32)
             joint_map = None
             if self.joint_maps:
-                cache = os.path.join(JOINT_MAP_DIR, meta["name"] + ".npz")
+                cache = os.path.join(JOINT_MAP_DIR, name + ".npz")
                 if not os.path.exists(cache):
-                    raise FileNotFoundError(f"joint map cache missing for {meta['name']}: run policy/compute_joint_maps.py")
+                    raise FileNotFoundError(f"joint map cache missing for {name}: run policy/compute_joint_maps.py")
                 with np.load(cache) as maps:
                     joint_map = maps["joint_map"][:T].astype(np.float32)
             goal_parts = [
@@ -206,7 +209,7 @@ class DemoDataset(Dataset):
             points = np.stack([to_base_frame(arrays["obs_point_cloud"][t].astype(np.float64), base[t])
                                for t in range(T)]).astype(np.float32)
             self.episodes.append({
-                "name": meta["name"], "schema_version": meta.get("schema_version"), "T": T, "points": points, "labels": arrays["obs_point_cloud_labels"][:T],
+                "name": name, "schema_version": meta.get("schema_version"), "T": T, "points": points, "labels": arrays["obs_point_cloud_labels"][:T],
                 "base": base, "proprio": proprio, "goal": goal,
                 "actions": arrays["action_policy"].astype(np.float32), "phase": arrays["phase"],
                 "phase_names": phase_names, "keep": keep, "source": source,

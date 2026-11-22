@@ -21,8 +21,8 @@ Schema saga_spot_demo_v2 (one <episode_id>.npz + <episode_id>.json per frozen ma
                               base frame divided by BASE_VELOCITY_SCALE (0 when no base command was issued);
       env input = clip(BaseActionModel.base_motion(*(action_policy[6:9] * scale), base_yaw,
                        compensate_yaw_offset=False, controller_frame=frame), -1, 1)
-      with base_yaw = obs_base_yaw_exact[t] and frame.theta = obs_base_controller_theta[t]
-      (robosuite's own float32 theta = current yaw - controller reset yaw, read live before action t);
+      with base_yaw = base_yaw_at_action[t] and frame.theta = base_controller_theta[t] (robosuite's own float32
+      theta = current yaw - controller reset yaw, read right after the expert's action t, before env.step);
     the arm (0:6) and gripper (9) parts are unchanged from v1.
 """
 
@@ -81,8 +81,6 @@ REQUIRED_ARRAYS = {
     "obs_point_cloud_valid_count": ("int32", (1,)),
     "obs_arm_qpos": ("float32", None), "obs_arm_qvel": ("float32", None), "obs_gripper_qpos": ("float32", None),
     "obs_base_pose": ("float32", (4,)), "obs_base_qvel": ("float32", (3,)),
-    "obs_base_yaw_exact": ("float64", (1,)), "obs_base_controller_theta": ("float32", (1,)),
-    "obs_base_controller_reset_yaw": ("float64", (1,)),
     "obs_controller_origin_position": ("float64", (3,)), "obs_controller_origin_rotation": ("float64", (3, 3)),
     "obs_base_rotation": ("float64", (3, 3)),
     "obs_eef_site_position": ("float64", (3,)), "obs_eef_site_quat_wxyz": ("float64", (4,)),
@@ -98,6 +96,8 @@ REQUIRED_ARRAYS = {
     "action_policy": ("float32", (10,)), "action_controller": ("float32", (10,)),
     "action_controller_exact": ("float64", (10,)),
     "base_velocity_command": ("float64", (3,)), "base_velocity_commanded": ("bool", ()),
+    "base_yaw_at_action": ("float64", (1,)), "base_controller_theta": ("float32", (1,)),
+    "base_controller_reset_yaw": ("float64", (1,)),
     "gripper_internal_command": ("float32", (1,)), "site_target": ("float64", (3,)),
     "rotation_target": ("float64", (3, 3)), "phase": ("int16", ()), "phase_step": ("int32", ()),
     "phase_transition": ("bool", ()), "reward": ("float32", ()), "terminated": ("bool", ()),
@@ -149,3 +149,38 @@ def split_of(index):
     if index in HELDOUT_EPISODES:
         return "heldout"
     raise ValueError(f"episode index {index} outside the frozen manifest")
+
+
+def validated_and_matching(prefix, head):
+    """
+    (True, reason) only if <prefix>.npz/.json/_validation.json exist, the validation passed, the files' sha256 equal
+    the validated ones (no change after validation) and the recording and validation were made at `head` (the
+    collection tooling commit) with the frozen stamps. Used to skip already validated outputs on resume.
+    """
+    import json
+
+    paths = {k: prefix + s for k, s in (("npz", ".npz"), ("json", ".json"), ("validation", "_validation.json"))}
+    missing = [k for k, p in paths.items() if not os.path.isfile(p)]
+    if missing:
+        return False, f"missing {missing}"
+    try:
+        validation = json.load(open(paths["validation"]))
+        meta = json.load(open(paths["json"]))
+    except (OSError, ValueError) as error:
+        return False, f"unreadable: {error}"
+    if not validation.get("passed"):
+        return False, "validation did not pass"
+    files = validation.get("files", {})
+    if file_sha256(paths["npz"]) != files.get("npz_sha256") or meta.get("npz_sha256") != files.get("npz_sha256"):
+        return False, "npz sha256 differs from the validated one"
+    if file_sha256(paths["json"]) != files.get("json_sha256"):
+        return False, "json sha256 differs from the validated one"
+    expected = {"schema_version": SCHEMA_VERSION, "release_id": RELEASE_ID, "manifest_sha256": MANIFEST_SHA256,
+                "expert_behavior_commit": EXPERT_BEHAVIOR_COMMIT, "audit_tooling_commit": AUDIT_TOOLING_COMMIT,
+                "collection_tooling_commit": head}
+    wrong = {k: meta.get(k) for k, v in expected.items() if meta.get(k) != v}
+    if validation.get("validator_commit") != head:
+        wrong["validator_commit"] = validation.get("validator_commit")
+    if wrong:
+        return False, f"stamps differ: {wrong}"
+    return True, "validated and matching"

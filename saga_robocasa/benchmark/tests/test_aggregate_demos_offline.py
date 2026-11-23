@@ -286,3 +286,39 @@ def test_v3_aggregation_summarizes_tolerated_differences_and_keeps_earlier_recor
         assert os.path.exists(os.path.join(root, name))
     assert not os.path.exists(os.path.join(root, "train_index.json"))
     assert all(open(p).read() == text for p, text in before.items())   # v1 and v2 records untouched
+
+
+FULL_A = "5ee5a5ad63c4eb8b6e6669bd470f5051ca002aec"
+FULL_B = "889153ad6c042298b0247f367d8994ee942cf8b5"
+
+
+def cli(*extra):
+    return AG.build_parser().parse_args(["--run-root", "/nonexistent", "--episodes", "all", *extra])
+
+
+def test_cli_accepts_full_40_character_hashes():
+    args = cli("--commit", FULL_A, "--validation-version", "v3", "--validator-commit", FULL_B)
+    assert (args.commit, args.validator_commit) == (FULL_A, FULL_B)
+    assert cli("--commit", FULL_A).validator_commit is None
+
+
+@pytest.mark.parametrize("bad", ["5ee5a5a", "889153a", FULL_A[:39], FULL_A + "0", FULL_A.upper(),
+                                 "g" * 40, "HEAD", "", " " + FULL_A[1:], FULL_A[:20] + "-" + FULL_A[21:]])
+@pytest.mark.parametrize("flag", ["--commit", "--validator-commit"])
+def test_cli_rejects_abbreviated_or_malformed_hashes(bad, flag, capsys):
+    argv = ["--commit", FULL_A, "--validator-commit", FULL_B]
+    argv[argv.index(flag) + 1] = bad
+    with pytest.raises(SystemExit) as exc:
+        cli(*argv)
+    assert exc.value.code == 2
+    assert "full 40-character" in capsys.readouterr().err
+
+
+def test_main_refuses_short_hash_before_reading_anything(tmp_path, monkeypatch):
+    monkeypatch.setattr(AG, "aggregate", lambda *a, **k: pytest.fail("aggregate must not run"))
+    monkeypatch.setattr(AG, "write_outputs", lambda *a, **k: pytest.fail("no outputs may be written"))
+    with pytest.raises(SystemExit) as exc:
+        AG.main(["--run-root", str(tmp_path), "--episodes", "all", "--commit", "5ee5a5a",
+                 "--validation-version", "v3", "--validator-commit", "889153a"])
+    assert exc.value.code == 2
+    assert os.listdir(tmp_path) == []

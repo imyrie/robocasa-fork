@@ -3,6 +3,8 @@ Aggregate and verify the counter_to_sink_v1 / expert-v3 demonstration dataset (n
 
     python saga_robocasa/scripts/demos_v3/aggregate_demos.py --run-root ROOT --episodes all --commit HEAD_SHA
 
+--commit and --validator-commit must be full 40-character lowercase hexadecimal hashes (abbreviations are refused).
+
 For every requested manifest episode, RUN_ROOT/episode_XXX/attempt_N/ is classified (validated / expert failure /
 validation failed / incomplete). The dataset is complete only if every episode has EXACTLY ONE validated attempt
 and:
@@ -341,14 +343,34 @@ def tolerated_lines(result):
     return lines + [""]
 
 
-def main():
+FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def full_commit_hash(value):
+    """argparse type: a full 40-character lowercase hexadecimal git commit hash.
+
+    Records store full hashes and are compared exactly, so an abbreviated hash (e.g. 5ee5a5a) would reject every
+    episode; it is refused at the command line instead."""
+    if not FULL_COMMIT_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a full 40-character lowercase hexadecimal commit hash (use `git rev-parse {value}`)")
+    return value
+
+
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--episodes", nargs="+", required=True, help="indices or 'all'")
-    parser.add_argument("--commit", required=True, help="collection tooling commit the recordings must be stamped with")
+    parser.add_argument("--commit", required=True, type=full_commit_hash,
+                        help="full 40-character collection tooling commit the recordings must be stamped with")
     parser.add_argument("--validation-version", default=None, help="e.g. v2: read <episode>_validation_v2.json records")
-    parser.add_argument("--validator-commit", default=None, help="validator commit required in the records (default: --commit)")
-    args = parser.parse_args()
+    parser.add_argument("--validator-commit", default=None, type=full_commit_hash,
+                        help="full 40-character validator commit required in the records (default: --commit)")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     global VALIDATION_SUFFIX
     if args.validation_version:
         VALIDATION_SUFFIX = f"_validation_{args.validation_version}.json"
@@ -359,8 +381,10 @@ def main():
     if hashlib.sha256(manifest_bytes).hexdigest() != DS.MANIFEST_SHA256:
         print("manifest checksum mismatch")
         return 2
-    validator_commit = subprocess.check_output(["git", "-C", DS.repo_root(), "rev-parse", args.validator_commit]).decode().strip() \
-        if args.validator_commit else None
+    validator_commit = None
+    if args.validator_commit:
+        validator_commit = subprocess.check_output(
+            ["git", "-C", DS.repo_root(), "rev-parse", "--verify", "--quiet", f"{args.validator_commit}^{{commit}}"]).decode().strip()
     result = aggregate(args.run_root, episodes, args.commit, json.loads(manifest_bytes), validator_commit=validator_commit)
     write_outputs(result, args.run_root, suffix=f"_{args.validation_version}" if args.validation_version else "")
     print("DATASET", json.dumps({k: result[k] for k in ("requested", "validated", "complete", "retries", "totals")}))

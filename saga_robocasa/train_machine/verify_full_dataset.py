@@ -68,7 +68,7 @@ def regions(n, batch_size, batches):
 def check_batch(batch, device, horizon, num_points, proprio_dim, goal_dim, action_dim, problems, label):
     batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
     b = len(batch["actions"])
-    expected = {"points": [b, num_points, 9], "proprio": [b, proprio_dim], "goal": [b, goal_dim],
+    expected = {"points": [b, num_points, 6], "proprio": [b, proprio_dim], "goal": [b, goal_dim],
                 "actions": [b, horizon, action_dim], "action_mask": [b, horizon], "arm_qpos": [b, 6], "phase": [b]}
     for key, shape in expected.items():
         if list(batch[key].shape) != shape:
@@ -82,8 +82,8 @@ def check_batch(batch, device, horizon, num_points, proprio_dim, goal_dim, actio
         problems.append(f"{label}: phase dtype {batch['phase'].dtype}")
     if batch["points"].device.type != device.type:
         problems.append(f"{label}: batch not on {device}")
-    labels = batch["points"][..., 6:]
-    if not ((labels == 0) | (labels == 1)).all() or (labels.sum(-1) > 1).any():
+    labels = batch["points"][..., 3:]  # xyz (3, standardized) + one-hot [object, sink, robot] (3)
+    if labels.shape[-1] != 3 or not ((labels == 0) | (labels == 1)).all() or (labels.sum(-1) > 1).any():
         problems.append(f"{label}: point labels are not one-hot/zero")
     return batch
 
